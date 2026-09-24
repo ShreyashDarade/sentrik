@@ -11,12 +11,16 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md requirements.lock ./
 COPY app ./app
 
-# Install the full stack (agents/observability/postgres extras) so the container has
-# LangChain/LangGraph/MCP/OpenTelemetry — not just core deps (F-03).
-RUN pip install --upgrade pip && pip install ".[agents,observability,postgres]" gunicorn
+# Reproducible install from the pinned lockfile (P-15), then the app itself without
+# re-resolving deps. The lock already includes the agents/observability/postgres stack
+# (LangChain/LangGraph/MCP/OpenTelemetry/psycopg), so the container matches dev (F-03).
+RUN pip install --upgrade pip \
+    && pip install -r requirements.lock \
+    && pip install --no-deps . \
+    && pip install gunicorn
 
 # Non-root runtime user
 RUN useradd -m -u 10001 sentrik && chown -R sentrik:sentrik /app

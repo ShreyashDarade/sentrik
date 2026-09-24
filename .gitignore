@@ -10,17 +10,7 @@ dist/
 .venv/
 venv/
 env/
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\.pytest_cache
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\.ruff_cache
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\.venv
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\audit
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\benchmarks
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\migrations
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\scripts
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\skills
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\tests
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\vulnapp
-C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\docs
+
 # Tooling caches
 .pytest_cache/
 .ruff_cache/
@@ -38,9 +28,14 @@ coverage.xml
 *.db
 *.db-wal
 *.db-shm
+sentrik.db*
+sentrik_checkpoints.db*
 sentinel.db*
 _live*.db*
 _m*.db*
+
+# Local object storage
+sentrik_storage/
 
 # OS
 .DS_Store
@@ -50,10 +45,10 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Internal QA/process artifacts (not shipped)
+# --- Published-repo scope (deliberate): the public repository ships the application
+# only. Tests, docs, the lab target, benchmarks, migrations and audit records live in
+# the private dev tree. README states this. Remove these lines to publish them.
 audit/
-
-# Excluded from the published repo (kept locally): aux/dev folders
 tests/
 docs/
 migrations/

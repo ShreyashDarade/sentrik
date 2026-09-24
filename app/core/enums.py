@@ -115,3 +115,4 @@ class CheckClass(str, Enum):
     SECURITY_HEADERS = "security_headers"
     INFO_DISCLOSURE = "info_disclosure"
     OPEN_REDIRECT = "open_redirect"
+    BUSINESS_LOGIC = "business_logic"

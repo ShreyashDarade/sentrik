@@ -110,11 +110,25 @@ async def _regress_xss(client, repro) -> RegressionResult:
     resp = await _send(client, method, url, {param: repro.get("payload", "")})
     raw = f"<szx{marker}>" if marker else repro.get("payload", "")
     escaped = f"&lt;szx{marker}&gt;" if marker else ""
-    if raw and raw in resp.text and (not escaped or escaped not in resp.text):
+    from app.checks.xss import renderable_html_context
+
+    renderable = renderable_html_context(
+        resp.status_code, resp.headers.get("content-type", "")
+    )
+    if (
+        renderable
+        and raw
+        and raw in resp.text
+        and (not escaped or escaped not in resp.text)
+    ):
         return RegressionResult(
             "still_vulnerable", "payload still reflected unescaped", _ev(resp)
         )
-    return RegressionResult("fixed", "payload no longer reflected unescaped", _ev(resp))
+    return RegressionResult(
+        "fixed",
+        "payload no longer reflected unescaped in an HTML response",
+        _ev(resp),
+    )
 
 
 async def _regress_open_redirect(client, repro) -> RegressionResult:

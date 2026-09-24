@@ -4,7 +4,7 @@ Deterministic by default: for each endpoint, every registered check whose class 
 authorized and whose `applies_to` heuristics match becomes a candidate plan step,
 ranked by a priority heuristic (auth-bearing + parameterized endpoints first).
 
-An optional LLM adapter (`enable_llm_planner`) can re-rank / add rationale, but the
+The PlannerAgent (LLM-brained when a key is set) can re-rank / annotate, but the
 deterministic plan is always the source of truth and the fallback — the LLM can never
 introduce a step for an unauthorized check class or endpoint.
 """

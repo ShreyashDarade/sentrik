@@ -22,11 +22,16 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import Agent, AgentContext
 from app.agents.brain import BrainTask, get_brain
+from app.agents.budget import (
+    LlmBudget,
+    reset_current_budget,
+    set_current_budget,
+)
 from app.agents.pool import AgentPool
 from app.agents.registry import load_declarative_checks
 from app.agents.router import router as capability_router
@@ -51,7 +56,11 @@ from app.core.enums import (
     TestIntensity,
 )
 from app.discovery.crawler import crawl
-from app.discovery.normalize import DiscoveredEndpoint, merge_endpoints
+from app.discovery.normalize import (
+    DiscoveredEndpoint,
+    endpoint_surface_signature,
+    merge_endpoints,
+)
 from app.discovery.parsers import parse_artifact
 from app.models import (
     Assessment,
@@ -69,7 +78,7 @@ from app.models import (
     ValidationResult,
 )
 from app.security.http_client import GuardedHttpClient
-from app.security.scope import ScopeGuard, ScopeViolation
+from app.security.scope import ScopeDecision, ScopeGuard, ScopeViolation
 from app.services import scoring
 from app.services.audit import write_audit
 from app.services.planning import build_plan
@@ -77,7 +86,7 @@ from app.services.remediation import build_remediation
 from app.services.sessions import establish_session
 from app.services.validation import validate_finding
 
-log = logging.getLogger("sentinel.orchestrator")
+log = logging.getLogger("sentrik.orchestrator")
 
 # --------------------------------------------------------------------------- #
 # Run registry (in-process). A production deployment swaps this for a queue.
@@ -115,6 +124,24 @@ def start_assessment(assessment_id: str) -> None:
         return
     task = asyncio.create_task(_supervise(assessment_id))
     _running[assessment_id] = task
+
+
+def start_approved_steps(assessment_id: str, step_ids: list[str]) -> None:
+    """Fire-and-forget execution of steps approved *after* the run finished (CP-03)."""
+    key = f"{assessment_id}:steps:{','.join(sorted(step_ids))}"
+    if key in _running and not _running[key].done():
+        return
+
+    async def _go() -> None:
+        try:
+            async with _sem():
+                await AssessmentEngine(assessment_id).execute_approved_steps(step_ids)
+        except Exception:  # noqa: BLE001
+            log.exception("approved-step execution failed for %s", assessment_id)
+        finally:
+            _running.pop(key, None)
+
+    _running[key] = asyncio.create_task(_go())
 
 
 async def _supervise(assessment_id: str) -> None:
@@ -247,11 +274,27 @@ class AssessmentEngine:
         self.assessment_id = assessment_id
         self.settings = get_settings()
         self._sm = get_sessionmaker()
+        # F-09: per-assessment LLM token/cost ledger. 0 ⇒ unbounded for that dimension.
+        self.llm_budget = LlmBudget(
+            max_tokens=self.settings.max_llm_tokens_per_assessment,
+            max_cost_usd=self.settings.max_llm_cost_usd_per_assessment,
+            cost_per_1k_tokens_usd=self.settings.llm_cost_per_1k_tokens_usd,
+        )
 
     # ------------------------------------------------------------------ #
     # Phase driver
     # ------------------------------------------------------------------ #
     async def run(self) -> None:
+        # F-09: install this assessment's token/cost ledger for the whole coroutine tree.
+        # asyncio.create_task copies the context, so pool child tasks inherit the ledger.
+        budget_token = set_current_budget(self.llm_budget)
+        try:
+            await self._run_inner()
+        finally:
+            reset_current_budget(budget_token)
+            await self._persist_llm_budget()
+
+    async def _run_inner(self) -> None:
         state = await self._load_state()
         if state is None:
             log.error("assessment %s not found", self.assessment_id)
@@ -271,7 +314,7 @@ class AssessmentEngine:
             )
 
         async with GuardedHttpClient(
-            guard, on_request=self._persist_request_count
+            guard, on_request=self._persist_request_count, sandbox=self._make_sandbox(guard)
         ) as client:
             try:
                 await self._checkpoint(AssessmentState.DISCOVERING)
@@ -339,6 +382,27 @@ class AssessmentEngine:
             await session.commit()
         return result
 
+    async def _persist_llm_budget(self) -> None:
+        """Record the assessment's final LLM token/cost usage to the audit log (F-09)."""
+        snapshot = self.llm_budget.snapshot()
+        if snapshot["calls"] == 0:
+            return  # no brain consults at all (e.g. pure deterministic short-circuit)
+        try:
+            org_id = await _org_id_of(self.assessment_id)
+            if not org_id:
+                return
+            async with self._sm() as session:
+                await write_audit(
+                    session,
+                    org_id=org_id,
+                    assessment_id=self.assessment_id,
+                    event="llm.budget",
+                    data=snapshot,
+                )
+                await session.commit()
+        except Exception:  # noqa: BLE001  accounting must never fail the assessment
+            log.debug("could not persist llm budget snapshot", exc_info=True)
+
     async def _agent_decision(
         self, agent: Agent, org_id: str, task: BrainTask, phase: str
     ):
@@ -399,8 +463,28 @@ class AssessmentEngine:
                 warnings.extend(res.warnings)
             org_id = assessment.org_id
 
-        # DiscoveryAgent (LLM-brained) decides whether to actively crawl beyond artifacts.
-        discovery_agent = DiscoveryAgent(runner=None, brain=get_brain())
+        # DiscoveryAgent (LLM-brained) decides whether to actively crawl beyond artifacts;
+        # the crawl itself is its deterministic, scope-enforced tool (runner).
+        async def _crawl_runner() -> None:
+            async with self._sm() as session:
+                assessment = await session.get(Assessment, self.assessment_id)
+                target = await session.get(Target, assessment.target_id)
+                base_url = target.base_url
+            try:
+                crawl_eps, crawl_warn = await crawl(
+                    client,
+                    base_url,
+                    max_pages=self.settings.crawl_max_pages,
+                    max_depth=self.settings.crawl_max_depth,
+                )
+                discovered.extend(crawl_eps)
+                warnings.extend(crawl_warn)
+            except ScopeViolation as exc:
+                warnings.append(f"crawl blocked: {exc.reason}")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"crawl error: {exc}")
+
+        discovery_agent = DiscoveryAgent(runner=_crawl_runner, brain=get_brain())
         crawl_decision = await self._agent_decision(
             discovery_agent,
             org_id,
@@ -416,24 +500,12 @@ class AssessmentEngine:
             phase="discovery",
         )
 
-        # passive crawl (best-effort, scope-enforced) — gated by the discovery agent
+        # passive crawl (best-effort, scope-enforced) — the agent acts on its decision
         if crawl_decision.action == "skip":
             warnings.append("discovery agent elected to skip active crawl")
-        else:
-            async with self._sm() as session:
-                assessment = await session.get(Assessment, self.assessment_id)
-                target = await session.get(Target, assessment.target_id)
-                base_url = target.base_url
-            try:
-                crawl_eps, crawl_warn = await crawl(
-                    client, base_url, max_pages=15, max_depth=2
-                )
-                discovered.extend(crawl_eps)
-                warnings.extend(crawl_warn)
-            except ScopeViolation as exc:
-                warnings.append(f"crawl blocked: {exc.reason}")
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"crawl error: {exc}")
+        await discovery_agent.act(
+            AgentContext(assessment_id=self.assessment_id), crawl_decision
+        )
 
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
@@ -534,21 +606,26 @@ class AssessmentEngine:
 
             plan_endpoints = endpoints
             incremental_skipped = 0
-            # Incremental scan (BE-10): a retest with incremental=true only tests the
-            # surface that is NEW or CHANGED vs the previous assessment (by fingerprint).
+            # Incremental scan (BE-10 / F-14): a retest with incremental=true tests the
+            # surface that is NEW *or CHANGED* vs the previous assessment. "Changed" is
+            # detected by a surface signature that includes parameters, auth, roles, body
+            # schema, and API version — not just the location fingerprint — so an endpoint
+            # that gained a parameter or flipped auth is re-tested, not silently skipped.
             if assessment.incremental and assessment.previous_assessment_id:
-                prev_fps = {
-                    fp
-                    for (fp,) in (
-                        await session.execute(
-                            select(Endpoint.fingerprint).where(
-                                Endpoint.assessment_id
-                                == assessment.previous_assessment_id
-                            )
+                prev_rows = (
+                    await session.execute(
+                        select(Endpoint).where(
+                            Endpoint.assessment_id
+                            == assessment.previous_assessment_id
                         )
-                    ).all()
-                }
-                filtered = [e for e in endpoints if e.fingerprint not in prev_fps]
+                    )
+                ).scalars().all()
+                prev_signatures = {_endpoint_signature(e) for e in prev_rows}
+                filtered = [
+                    e
+                    for e in endpoints
+                    if _endpoint_signature(e) not in prev_signatures
+                ]
                 incremental_skipped = len(endpoints) - len(filtered)
                 plan_endpoints = filtered
 
@@ -578,6 +655,12 @@ class AssessmentEngine:
             phase="planning",
         )
         planned = _apply_strategy(planned, strat.action)
+        # Optional Deep Agents re-ranker (pure reorder; no-op unless enabled + key set).
+        from app.agents.deepagents_planner import rerank_plan
+
+        planned = await rerank_plan(
+            planned, {"assessment_id": self.assessment_id, "classes": sorted(effective)}
+        )
 
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
@@ -618,6 +701,7 @@ class AssessmentEngine:
         self, guard: ScopeGuard, steps: list[PlanStep]
     ) -> list[PlanStep]:
         allowed: list[PlanStep] = []
+        held: list[str] = []  # CP-03: steps waiting for per-action operator approval
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
             declaratives = await load_declarative_checks(session, assessment.org_id)
@@ -632,27 +716,85 @@ class AssessmentEngine:
                     }
                     continue
                 decision = guard.check_class_allowed(s.check_class, check.intensity)
+                # F-11: enforce declarative policy (allowed environments + state-changing)
+                # in the deterministic policy layer, beneath the LLM. A declarative check
+                # may narrow — never widen — what the authorization record already permits.
+                policy_reason, policy_code = _declarative_policy_block(check, guard.record)
+                if decision.allowed and policy_reason:
+                    decision = ScopeDecision(False, policy_reason, code=policy_code)
                 s.policy_decision = {
                     "allowed": decision.allowed,
                     "reason": decision.reason,
                     "code": decision.code,
                 }
-                if decision.allowed:
-                    s.status = "approved"
-                    allowed.append(s)
-                else:
+                if not decision.allowed:
                     s.status = "denied"
+                    continue
+                # CP-03: per-action approval. Steps that mutate state or are invasive are
+                # policy-permitted but still held until an operator approves *that step*.
+                if self.settings.step_approval_required and _step_needs_approval(check):
+                    s.status = "awaiting_approval"
+                    s.policy_decision["requires_approval"] = True
+                    s.policy_decision["approval_reason"] = (
+                        "state-changing check"
+                        if getattr(check, "state_changing", False)
+                        else "invasive intensity"
+                    )
+                    held.append(s.id)
+                    continue
+                s.status = "approved"
+                allowed.append(s)
             await write_audit(
                 session,
                 org_id=assessment.org_id,
                 assessment_id=self.assessment_id,
                 event="policy.evaluated",
-                data={"approved": len(allowed), "total": len(steps)},
+                data={
+                    "approved": len(allowed),
+                    "awaiting_approval": len(held),
+                    "total": len(steps),
+                },
             )
             await session.commit()
             # reload approved steps detached
             ids = [s.id for s in allowed]
+        if held:
+            ids.extend(await self._await_step_approvals(held))
         return await self._reload_steps(ids)
+
+    async def _await_step_approvals(self, step_ids: list[str]) -> list[str]:
+        """Bounded wait for operator decisions on held steps (CP-03).
+
+        Polls the plan steps until each is approved/denied, the wait budget expires, or
+        the assessment is cancelled. Returns the ids that became ``approved`` in time;
+        steps still awaiting approval are left as-is (they can be executed later via the
+        approve endpoint, which runs them under a fresh scope-guarded client).
+        """
+        wait = max(0, int(self.settings.step_approval_wait_seconds))
+        approved: list[str] = []
+        pending = set(step_ids)
+        deadline = time.monotonic() + wait
+        while pending:
+            async with self._sm() as session:
+                rows = (
+                    (
+                        await session.execute(
+                            select(PlanStep).where(PlanStep.id.in_(list(pending)))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            for row in rows:
+                if row.status == "approved":
+                    approved.append(row.id)
+                    pending.discard(row.id)
+                elif row.status in ("denied", "skipped"):
+                    pending.discard(row.id)
+            if not pending or time.monotonic() >= deadline or await self._cancelled():
+                break
+            await asyncio.sleep(max(0.05, self.settings.step_approval_poll_seconds))
+        return approved
 
     # ------------------------------------------------------------------ #
     # Phase: execute — run approved steps via LLM-brained specialist agents
@@ -683,6 +825,8 @@ class AssessmentEngine:
                 context={
                     "approved_steps": len(steps),
                     "budget_remaining": coord_ctx.budget_remaining(),
+                    "llm_budget_exceeded": self.llm_budget.exceeded(),
+                    "llm_tokens_used": self.llm_budget.total_tokens,
                 },
                 allowed_actions=["continue", "stop", "replan"],
             ),
@@ -799,7 +943,8 @@ class AssessmentEngine:
                 agent = agent_by_id.get(aid)
                 if agent is None:
                     continue
-                await asyncio.sleep(0.05 * attempt)  # linear backoff
+                # linear backoff, base from settings (H-02)
+                await asyncio.sleep(self.settings.retry_backoff_seconds * attempt)
                 res = await agent.run(ctx)
                 await self._persist_agent_result(
                     org_id, step_by_agent.get(aid), res, attempts=attempt
@@ -1006,6 +1151,77 @@ class AssessmentEngine:
                 )
                 await session.commit()
 
+    async def execute_approved_steps(self, step_ids: list[str]) -> int:
+        """Run steps an operator approved after the assessment completed (CP-03).
+
+        Uses the *same* authorization record via a fresh ScopeGuard/GuardedHttpClient (so
+        budgets, rate limits, sandbox egress rules and the testing window still apply),
+        then independently validates any new findings and re-scores. Returns the number
+        of findings produced.
+        """
+        steps = [
+            s for s in await self._reload_steps(step_ids) if s.status == "approved"
+        ]
+        if not steps:
+            return 0
+        guard = await self._make_guard()
+        precheck = guard.check_record_active()
+        org_id = await _org_id_of(self.assessment_id)
+        if not precheck.allowed or not org_id:
+            async with self._sm() as session:
+                for s in steps:
+                    row = await session.get(PlanStep, s.id)
+                    row.status = "skipped"
+                    row.policy_decision = {
+                        **(row.policy_decision or {}),
+                        "post_approval_block": precheck.reason,
+                    }
+                await session.commit()
+            return 0
+        budget_token = set_current_budget(self.llm_budget)
+        found = 0
+        try:
+            async with GuardedHttpClient(
+                guard,
+                on_request=self._persist_request_count,
+                sandbox=self._make_sandbox(guard),
+            ) as client:
+                sessions = await self._build_sessions()
+                deadline = time.monotonic() + min(
+                    guard.record.max_duration_seconds
+                    or self.settings.max_assessment_seconds,
+                    self.settings.max_assessment_seconds,
+                )
+                controller = _ExecController(deadline=deadline, client=client)
+                async with self._sm() as session:
+                    declaratives = await load_declarative_checks(session, org_id)
+                found = await self._execute_step_batch(
+                    client,
+                    guard,
+                    steps,
+                    sessions,
+                    get_brain(),
+                    org_id,
+                    declaratives,
+                    controller,
+                )
+                await self._phase_validate(client, guard)
+            await self._phase_score()
+            async with self._sm() as session:
+                await write_audit(
+                    session,
+                    org_id=org_id,
+                    assessment_id=self.assessment_id,
+                    event="execution.approved_steps",
+                    data={"steps": [s.id for s in steps], "new_findings": found},
+                )
+                await session.commit()
+        except ScopeViolation as exc:
+            log.warning("approved-step execution halted by scope: %s", exc.reason)
+        finally:
+            reset_current_budget(budget_token)
+        return found
+
     async def _execute_step_batch(
         self, client, guard, steps, sessions, brain, org_id, declaratives, controller
     ) -> int:
@@ -1182,16 +1398,27 @@ class AssessmentEngine:
             ]
 
         brain = get_brain()
+        # CP-04: session-relative proofs (BOLA) need the assessment's own test-account
+        # sessions. Built once, lazily, only if such a finding exists.
+        sessions = None
+        if any(c == "bola" for _, c, _ in finding_data):
+            sessions = await self._build_sessions()
         for fid, cclass, repro in finding_data:
             if await self._cancelled():
                 break
             agent = ValidationAgent(
                 validator_coro=lambda c=cclass, r=repro: validate_finding(
-                    client, check_class=c, reproduction=r
+                    client, check_class=c, reproduction=r, sessions=sessions
                 ),
                 brain=brain,
             )
-            ctx = AgentContext(assessment_id=self.assessment_id)
+            ctx = AgentContext(
+                assessment_id=self.assessment_id,
+                budget_remaining_getter=lambda: max(
+                    0, guard.record.max_requests - guard.requests_made
+                ),
+                extra={"check_class": cclass, "detector": repro.get("detector", "")},
+            )
             try:
                 outcome = await agent.validate(ctx)
             except Exception as exc:  # noqa: BLE001
@@ -1444,25 +1671,56 @@ class AssessmentEngine:
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
             org_id = assessment.org_id
+        async with self._sm() as session:
+            n_confirmed = (
+                await session.execute(
+                    select(func.count(Finding.id)).where(
+                        Finding.assessment_id == self.assessment_id,
+                        Finding.status == FindingStatus.CONFIRMED.value,
+                    )
+                )
+            ).scalar_one()
+            n_total = (
+                await session.execute(
+                    select(func.count(Finding.id)).where(
+                        Finding.assessment_id == self.assessment_id
+                    )
+                )
+            ).scalar_one()
         reporter = ReporterAgent(brain=get_brain())
-        await self._agent_decision(
+        decision = await self._agent_decision(
             reporter,
             org_id,
             BrainTask(
                 role="reporter",
-                instruction="Render the assessment report.",
-                context={"assessment_id": self.assessment_id},
-                allowed_actions=["render"],
+                instruction=(
+                    "Choose the report emphasis: 'risk-first' leads with confirmed "
+                    "findings; 'coverage-first' leads with tested/untested surface."
+                ),
+                context={
+                    "assessment_id": self.assessment_id,
+                    "confirmed_findings": n_confirmed,
+                    "total_findings": n_total,
+                },
+                allowed_actions=list(ReporterAgent.EMPHASES),
             ),
             phase="report",
         )
+        emphasis = (
+            decision.action
+            if decision.action in ReporterAgent.EMPHASES
+            else ReporterAgent.EMPHASES[0]
+        )
         async with self._sm() as session:
+            a = await session.get(Assessment, self.assessment_id)
+            # The renderer reads this to order report sections (see services/reporting).
+            a.summary = {**(a.summary or {}), "report_emphasis": emphasis}
             await write_audit(
                 session,
                 org_id=org_id,
                 assessment_id=self.assessment_id,
                 event="reporting.ready",
-                data={},
+                data={"emphasis": emphasis},
             )
             await session.commit()
 
@@ -1560,6 +1818,14 @@ class AssessmentEngine:
             record = await session.get(AuthorizationRecord, a.authorization_id)
             return ScopeGuard(record, requests_made=a.requests_made or 0)
 
+    def _make_sandbox(self, guard: ScopeGuard):
+        """Build a per-run Sandbox (defense-in-depth egress allowlist) when enabled."""
+        if self.settings.sandbox_mode == "none":
+            return None
+        from app.security.sandbox import sandbox_for
+
+        return sandbox_for(guard.record, self.settings)
+
     async def _persist_request_count(self, count: int) -> None:
         # lightweight periodic persistence of the running request counter
         if count % 10 != 0:
@@ -1593,7 +1859,7 @@ class AssessmentEngine:
         await self._set_state(AssessmentState.DISCOVERING)
         guard = await self._make_guard()
         async with GuardedHttpClient(
-            guard, on_request=self._persist_request_count
+            guard, on_request=self._persist_request_count, sandbox=self._make_sandbox(guard)
         ) as client:
             await self._phase_discovery(client, guard)
         await self._persist_exact_count(guard.requests_made)
@@ -1658,7 +1924,7 @@ class AssessmentEngine:
             for s in steps:
                 session.expunge(s)
         async with GuardedHttpClient(
-            guard, on_request=self._persist_request_count
+            guard, on_request=self._persist_request_count, sandbox=self._make_sandbox(guard)
         ) as client:
             await self._phase_execute(client, guard, steps)
         await self._persist_exact_count(guard.requests_made)
@@ -1668,7 +1934,7 @@ class AssessmentEngine:
         await self._set_state(AssessmentState.VALIDATING)
         guard = await self._make_guard()
         async with GuardedHttpClient(
-            guard, on_request=self._persist_request_count
+            guard, on_request=self._persist_request_count, sandbox=self._make_sandbox(guard)
         ) as client:
             await self._phase_validate(client, guard)
         await self._persist_exact_count(guard.requests_made)
@@ -1742,6 +2008,62 @@ class AssessmentEngine:
 # --------------------------------------------------------------------------- #
 # module helpers
 # --------------------------------------------------------------------------- #
+def _step_needs_approval(check) -> bool:
+    """CP-03: a step needs explicit per-action approval if it may change target state
+    or is invasive; everything else (passive / safe-active, read-only) does not."""
+    if getattr(check, "state_changing", False):
+        return True
+    intensity = getattr(check, "intensity", None)
+    return intensity == TestIntensity.INVASIVE
+
+
+def _declarative_policy_block(check, record) -> tuple[str | None, str | None]:
+    """Enforce a declarative check's declared policy against the authorization record (F-11).
+
+    A registered declarative skill may carry ``policy.state_changing`` and
+    ``policy.environments``. These can only *narrow* what the record already permits:
+
+    * a state-changing declarative check is denied unless the record allows state-changing
+      tests (the same rule the network gate applies to unsafe HTTP methods), and
+    * a check that names an allowed-environment list is denied outside those environments.
+
+    Returns ``(reason, code)`` when the step must be denied, else ``(None, None)``.
+    Non-declarative built-in checks are unaffected (they carry no declarative policy).
+    """
+    from app.checks.declarative import DeclarativeCheck
+
+    if not isinstance(check, DeclarativeCheck):
+        return (None, None)
+    if getattr(check, "state_changing", False) and not record.allow_state_changing:
+        return (
+            "declarative check is state-changing but the authorization record does not "
+            "permit state-changing tests",
+            "declarative_state_change_denied",
+        )
+    envs = getattr(check, "allowed_environments", []) or []
+    if envs and (record.environment or "").lower() not in envs:
+        return (
+            f"declarative check restricted to environments {envs}; "
+            f"authorization environment is {record.environment!r}",
+            "declarative_environment_denied",
+        )
+    return (None, None)
+
+
+def _endpoint_signature(e: Endpoint) -> str:
+    """Change-sensitive surface signature of a persisted endpoint row (F-14)."""
+    return endpoint_surface_signature(
+        e.method,
+        e.url,
+        e.path_template,
+        parameters=list(e.parameters or []),
+        auth_required=bool(e.auth_required),
+        roles=list(e.roles or []),
+        request_body_schema=dict(e.request_body_schema or {}),
+        api_version=e.api_version or "",
+    )
+
+
 def _endpoint_view(e: Endpoint) -> EndpointView:
     return EndpointView(
         id=e.id,

@@ -46,6 +46,7 @@ import secrets
 from dataclasses import dataclass
 
 from app.checks.base import BaseCheck, CheckContext, RawEvidence, RawFinding
+from app.checks.xss import renderable_html_context
 from app.core.enums import Confidence, Severity, TestIntensity
 from app.security.http_client import TargetUnreachable
 from app.security.redaction import build_evidence_exchange
@@ -106,6 +107,13 @@ class DeclarativeCheck(BaseCheck):
         )
         self.cwe = str(self.manifest.get("cwe", ""))
         self.state_changing = bool(self.manifest.get("state_changing", False))
+        # F-11: declarative policy — which environments this check may run in. Empty ⇒ any
+        # (subject to the deterministic scope/intensity gates). Normalized to lower-case.
+        self.allowed_environments = [
+            str(e).lower()
+            for e in (self.manifest.get("allowed_environments") or [])
+            if str(e).strip()
+        ]
         self.detector = self.manifest.get("detector", {}) or {}
         self._severity = _coerce_sev(str(self.manifest.get("severity", "medium")))
         self._confidence = _coerce_conf(str(self.manifest.get("confidence", "medium")))
@@ -260,6 +268,12 @@ class DeclarativeCheck(BaseCheck):
             token = secrets.token_hex(5)
             marker = template.format(token=token)
             resp = await self._send(ctx, {name: marker})
+            # Same rule as the built-in XSS check: only an HTML document with a
+            # non-error status is a renderable context (JSON/4xx echoes are not).
+            if not renderable_html_context(
+                resp.status_code, resp.headers.get("content-type", "")
+            ):
+                continue
             escaped = marker.replace("<", "&lt;").replace(">", "&gt;")
             if marker in resp.text and (escaped == marker or escaped not in resp.text):
                 return [
@@ -274,6 +288,7 @@ class DeclarativeCheck(BaseCheck):
                             "param": name,
                             "payload": marker,
                             "marker": token,
+                            "marker_template": template,
                             "detector": "reflection",
                         },
                     )

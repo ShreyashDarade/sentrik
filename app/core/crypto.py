@@ -15,7 +15,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from app.core.config import get_settings
 
-log = logging.getLogger("sentinel.crypto")
+log = logging.getLogger("sentrik.crypto")
 
 _fernet: Fernet | None = None
 

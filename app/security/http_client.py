@@ -57,13 +57,14 @@ class RateLimiter:
 
 
 class GuardedHttpClient:
-    def __init__(self, guard: ScopeGuard, *, on_request=None):
+    def __init__(self, guard: ScopeGuard, *, on_request=None, sandbox=None):
         self.guard = guard
         self._settings = get_settings()
         self._rate = RateLimiter(
             guard.record.rate_limit_per_sec or self._settings.default_rate_limit_per_sec
         )
         self._on_request = on_request  # callback(count) for accounting/persistence
+        self._sandbox = sandbox  # optional per-run Sandbox: extra egress allowlist gate
         self._client: httpx.AsyncClient | None = None
         # Target-health signals (AU-08). We track *connection* failures, not HTTP 5xx,
         # because a 5xx can be an intended probe result (e.g. error-based SQLi).
@@ -112,6 +113,11 @@ class GuardedHttpClient:
         # then connects to the *validated* IP (see _build_pinned), fully closing the
         # resolve→connect TOCTOU while TLS SNI/cert validation keeps the hostname.
         self._assert_no_rebinding(url, decision.details.get("ips") or [])
+        # Defense-in-depth per-run sandbox egress allowlist (independent of ScopeGuard).
+        if self._sandbox is not None:
+            self._sandbox.assert_egress_allowed(
+                decision.details.get("host", ""), decision.details.get("port", 0)
+            )
 
         await self._rate.acquire()
         self.guard.note_requests(1)

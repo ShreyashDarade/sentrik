@@ -23,9 +23,10 @@ from typing import Any
 
 import httpx
 
+from app.agents.budget import get_current_budget
 from app.core.config import get_settings
 
-log = logging.getLogger("sentinel.brain")
+log = logging.getLogger("sentrik.brain")
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -47,8 +48,11 @@ class BrainDecision:
     action: str  # chosen action (validated by caller against allowed_actions)
     reasoning: str  # short rationale (for audit trail)
     params: dict = field(default_factory=dict)
-    source: str = "deterministic"  # "llm" | "deterministic" | "llm_fallback"
+    # "llm" | "deterministic" | "llm_fallback" | "budget_exceeded" | "local_llm"…
+    source: str = "deterministic"
     confidence: float = 0.6
+    input_tokens: int = 0  # LLM usage for this decision (0 for deterministic)
+    output_tokens: int = 0
 
 
 class Brain:
@@ -128,6 +132,15 @@ class LLMBrain(Brain):
         self.transport = "langchain" if self._lc is not None else "httpx"
 
     async def decide(self, task: BrainTask) -> BrainDecision:
+        # F-09: if the assessment's token/cost budget is already spent, do not make the
+        # network call — degrade to the deterministic brain and mark the source so the
+        # audit trail shows *why* this decision was not LLM-reasoned.
+        budget = get_current_budget()
+        if budget is not None and budget.exceeded():
+            d = await self._fallback.decide(task)
+            d.source = "budget_exceeded"
+            return d
+
         user = json.dumps(
             {
                 "role": task.role,
@@ -138,9 +151,9 @@ class LLMBrain(Brain):
         )
         try:
             if self._lc is not None:
-                text = await self._decide_langchain(user)
+                text, usage = await self._decide_langchain(user)
             else:
-                text = await self._decide_httpx(user, task.max_tokens)
+                text, usage = await self._decide_httpx(user, task.max_tokens)
             decision = _parse_decision(text)
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             log.warning("LLM brain error (%s); falling back", exc)
@@ -149,6 +162,11 @@ class LLMBrain(Brain):
             log.warning("LLM brain (langchain) error (%s); falling back", exc)
             return await self._fallback_with_source(task)
 
+        # Record token usage against the active per-assessment ledger (F-09).
+        in_tok, out_tok = usage
+        decision.input_tokens, decision.output_tokens = in_tok, out_tok
+        if budget is not None:
+            budget.record(in_tok, out_tok)
         # Validate the LLM's chosen action against the closed allowed set.
         if task.allowed_actions and decision.action not in task.allowed_actions:
             decision.action = task.allowed_actions[0]
@@ -156,7 +174,7 @@ class LLMBrain(Brain):
         decision.source = "llm"
         return decision
 
-    async def _decide_langchain(self, user: str) -> str:
+    async def _decide_langchain(self, user: str) -> tuple[str, tuple[int, int]]:
         from langchain_core.messages import HumanMessage, SystemMessage
 
         resp = await self._lc.ainvoke(
@@ -167,9 +185,11 @@ class LLMBrain(Brain):
             content = "".join(
                 b.get("text", "") if isinstance(b, dict) else str(b) for b in content
             )
-        return str(content)
+        return str(content), _langchain_usage(resp)
 
-    async def _decide_httpx(self, user: str, max_tokens: int) -> str:
+    async def _decide_httpx(
+        self, user: str, max_tokens: int
+    ) -> tuple[str, tuple[int, int]]:
         payload = {
             "model": self._model,
             "max_tokens": max_tokens,
@@ -185,7 +205,12 @@ class LLMBrain(Brain):
             resp = await client.post(ANTHROPIC_URL, headers=headers, json=payload)
         if resp.status_code >= 400:
             raise httpx.HTTPError(f"LLM brain HTTP {resp.status_code}")
-        return _extract_text(resp.json())
+        data = resp.json()
+        usage = data.get("usage") or {}
+        return _extract_text(data), (
+            int(usage.get("input_tokens", 0) or 0),
+            int(usage.get("output_tokens", 0) or 0),
+        )
 
     async def _fallback_with_source(self, task: BrainTask) -> BrainDecision:
         d = await self._fallback.decide(task)
@@ -210,6 +235,12 @@ class LocalLLMBrain(Brain):
         self.transport = "openai_compatible"
 
     async def decide(self, task: BrainTask) -> BrainDecision:
+        budget = get_current_budget()
+        if budget is not None and budget.exceeded():
+            d = await self._fallback.decide(task)
+            d.source = "budget_exceeded"
+            return d
+
         user = json.dumps(
             {
                 "role": task.role,
@@ -236,13 +267,20 @@ class LocalLLMBrain(Brain):
                 )
             if resp.status_code >= 400:
                 raise httpx.HTTPError(f"local LLM HTTP {resp.status_code}")
-            text = resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"]
             decision = _parse_decision(text)
         except Exception as exc:  # noqa: BLE001
             log.warning("local LLM brain error (%s); falling back", exc)
             d = await self._fallback.decide(task)
             d.source = "local_llm_fallback"
             return d
+        usage = data.get("usage") or {}
+        in_tok = int(usage.get("prompt_tokens", 0) or 0)
+        out_tok = int(usage.get("completion_tokens", 0) or 0)
+        decision.input_tokens, decision.output_tokens = in_tok, out_tok
+        if budget is not None:
+            budget.record(in_tok, out_tok)
         if task.allowed_actions and decision.action not in task.allowed_actions:
             decision.action = task.allowed_actions[0]
         decision.source = "local_llm"
@@ -307,6 +345,29 @@ def _truncate_context(ctx: dict, limit: int = 4000) -> dict:
     if len(text) <= limit:
         return ctx
     return {"_truncated": True, "preview": text[:limit]}
+
+
+def _langchain_usage(resp) -> tuple[int, int]:
+    """Extract (input_tokens, output_tokens) from a LangChain AIMessage.
+
+    LangChain surfaces token counts in ``usage_metadata`` (preferred) or, for older
+    providers, in ``response_metadata['usage']`` / ``['token_usage']``. Missing counts
+    degrade to 0 so budgeting never crashes on a provider that omits usage.
+    """
+    meta = getattr(resp, "usage_metadata", None)
+    if isinstance(meta, dict):
+        return (
+            int(meta.get("input_tokens", 0) or 0),
+            int(meta.get("output_tokens", 0) or 0),
+        )
+    rmeta = getattr(resp, "response_metadata", None) or {}
+    usage = rmeta.get("usage") or rmeta.get("token_usage") or {}
+    if isinstance(usage, dict):
+        return (
+            int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0),
+            int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0),
+        )
+    return (0, 0)
 
 
 def _extract_text(data: dict) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -76,6 +77,43 @@ def endpoint_fingerprint(method: str, url: str, path_template: str = "") -> str:
     tmpl = path_template or templatize_path(parts.path or "/")
     key = f"{method.upper()} {host}:{port}{tmpl}"
     return hashlib.sha1(key.encode()).hexdigest()
+
+
+def endpoint_surface_signature(
+    method: str,
+    url: str,
+    path_template: str = "",
+    *,
+    parameters: list[dict] | None = None,
+    auth_required: bool = False,
+    roles: list[str] | None = None,
+    request_body_schema: dict | None = None,
+    api_version: str = "",
+) -> str:
+    """A change-sensitive signature of an endpoint's *testable surface* (F-14).
+
+    The plain :func:`endpoint_fingerprint` only identifies location (method + host + path
+    template), so a retest driven purely by fingerprint would skip an endpoint whose
+    parameters, authentication, roles, request body, or API version changed since the last
+    assessment — exactly the surface a regression retest must re-cover. This signature adds
+    those dimensions so an incremental scan re-tests changed endpoints, not just new ones.
+    """
+    params = sorted(
+        f"{(p.get('name') or '').lower()}:{(p.get('in') or 'query').lower()}"
+        for p in (parameters or [])
+        if p.get("name")
+    )
+    body_keys = sorted((request_body_schema or {}).keys())
+    payload = {
+        "fp": endpoint_fingerprint(method, url, path_template),
+        "params": params,
+        "auth": bool(auth_required),
+        "roles": sorted(r for r in (roles or []) if r),
+        "body": body_keys,
+        "api_version": api_version or "",
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(canonical.encode()).hexdigest()
 
 
 def merge_endpoints(endpoints: list[DiscoveredEndpoint]) -> list[DiscoveredEndpoint]:

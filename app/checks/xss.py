@@ -15,6 +15,20 @@ from app.security.http_client import TargetUnreachable
 from app.security.redaction import build_evidence_exchange
 
 
+def renderable_html_context(status_code: int, content_type: str) -> bool:
+    """True if a reflected payload in this response could execute in a browser.
+
+    Requires a non-error status (4xx/5xx validation-error bodies echo input but are not
+    the application's rendered page) and an HTML content type — or no content type at
+    all, where browsers may sniff HTML. Shared by the check, the declarative
+    ``reflection`` detector and the independent validator so they agree.
+    """
+    if status_code >= 400:
+        return False
+    ctype = (content_type or "").lower()
+    return ctype == "" or "html" in ctype
+
+
 class ReflectedXssCheck(BaseCheck):
     name = "xss.reflected"
     check_class = CheckClass.XSS
@@ -55,6 +69,11 @@ class ReflectedXssCheck(BaseCheck):
         raw_present = f"<szx{token}>" in body
         escaped_present = f"&lt;szx{token}&gt;" in body
 
+        # Only a document a browser renders as HTML can execute a reflected payload.
+        # JSON/plain-text echoes (e.g. framework 4xx validation errors that quote the
+        # offending input) are not XSS, so they must not be reported as such.
+        if not renderable_html_context(resp.status_code, ctype):
+            return None
         if raw_present and not escaped_present:
             severity = Severity.HIGH if "html" in ctype else Severity.MEDIUM
             confidence = Confidence.HIGH if "html" in ctype else Confidence.MEDIUM

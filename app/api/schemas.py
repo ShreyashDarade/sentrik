@@ -194,6 +194,25 @@ class AssessmentProgress(BaseModel):
     agents_instantiated: int = 0
 
 
+class PlanStepOut(BaseModel):
+    id: str
+    assessment_id: str
+    endpoint_id: str | None = None
+    check_class: str
+    check_name: str
+    intensity: str
+    priority: int
+    status: str  # planned|approved|awaiting_approval|denied|skipped|done|errored
+    rationale: str = ""
+    policy_decision: dict = Field(default_factory=dict)
+
+
+class StepDecision(BaseModel):
+    """Operator decision on a held (awaiting_approval) plan step (CP-03)."""
+
+    note: str = Field(default="", max_length=500)
+
+
 class RetestCreate(BaseModel):
     requested_check_classes: list[str] = Field(default_factory=list)
     incremental: bool = (

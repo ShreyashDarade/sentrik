@@ -137,6 +137,30 @@ async def revoke_api_key(
     await session.commit()
 
 
+@router.post("/v1/onboarding/oidc/login", response_model=TokenResult)
+async def oidc_login(body: dict):
+    """SSO/OIDC login: exchange a provider ID token for a Sentrik JWT.
+
+    The identity is mapped to a PRE-EXISTING active user by email; OIDC never creates
+    tenants/users or elevates roles. Requires SENTINEL_OIDC_* to be configured.
+    Body: {"id_token": "<provider id token>"}.
+    """
+    from app.core.oidc import login_with_id_token
+
+    id_token = str(body.get("id_token", "")).strip()
+    if not id_token:
+        raise HTTPException(status_code=422, detail="'id_token' is required")
+    try:
+        result = await login_with_id_token(id_token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return TokenResult(
+        access_token=result["access_token"],
+        org_id=result["org_id"],
+        role=result["role"],
+    )
+
+
 @router.get("/v1/me")
 async def whoami(principal: Principal = Depends(get_principal)):
     return {

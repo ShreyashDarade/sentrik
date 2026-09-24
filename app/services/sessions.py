@@ -33,7 +33,7 @@ class SessionState:
     account_id: str
     role_name: str
     label: str
-    status: str  # "active" | "pending_mfa" | "failed" | "expired"
+    status: str  # "active" | "pending_mfa" | "failed" | "expired" | "stale"
     headers: dict = field(default_factory=dict)
     cookies: dict = field(default_factory=dict)
     owns_object_ids: list = field(default_factory=list)

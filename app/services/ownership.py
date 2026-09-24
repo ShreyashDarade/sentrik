@@ -1,8 +1,8 @@
 """Ownership / authorization-to-test verification.
 
 Supported methods:
-  * dns_txt          — a TXT record `sentinel-site-verification=<token>` on the host.
-  * http_file        — a file at /.well-known/sentinel-verification.txt containing the token.
+  * dns_txt          — a TXT record `sentrik-site-verification=<token>` on the host.
+  * http_file        — a file at /.well-known/sentrik-verification.txt containing the token.
   * manual_attestation — a signed delegated-permission attestation (hash recorded).
   * lab_bundled      — the bundled controlled vulnerable app; auto-trusted on loopback only.
 

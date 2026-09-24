@@ -123,7 +123,7 @@ def configure_tracing() -> None:
         _TRACING_READY = True
         return
 
-    provider = TracerProvider(resource=Resource.create({"service.name": "sentinel"}))
+    provider = TracerProvider(resource=Resource.create({"service.name": "sentrik"}))
     memory_span_exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(memory_span_exporter))
 
@@ -141,11 +141,11 @@ def configure_tracing() -> None:
                 BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
             )
         except Exception:  # noqa: BLE001
-            log = logging.getLogger("sentinel.tracing")
+            log = logging.getLogger("sentrik.tracing")
             log.warning("OTLP exporter unavailable; traces captured in-memory only")
 
     trace.set_tracer_provider(provider)
-    _tracer = trace.get_tracer("sentinel")
+    _tracer = trace.get_tracer("sentrik")
     _TRACING_READY = True
 
 

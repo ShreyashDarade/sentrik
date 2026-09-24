@@ -62,13 +62,27 @@ client ──▶ FastAPI (app/api) ──▶ Assessment engine (app/orchestratio
 ```bash
 python -m venv .venv
 . .venv/Scripts/activate          # Windows;  source .venv/bin/activate on macOS/Linux
-pip install -e ".[agents]"        # add ,postgres,observability for prod extras
+pip install -r requirements.lock  # reproducible, pinned (what the Docker image installs)
+pip install --no-deps -e .        # the app itself; extras: .[agents,postgres,storage,observability,dev]
 
 uvicorn app.main:app --reload     # API + interactive docs at http://127.0.0.1:8000/docs
 ```
 
-The app creates its own database schema on startup (SQLite by default; point
-`SENTINEL_DATABASE_URL` at Postgres for production).
+The app creates its own database schema on startup (`init_db` → `create_all`; SQLite
+`./sentrik.db` by default, point `SENTINEL_DATABASE_URL` at Postgres for production).
+There is no separate migration step. The durable LangGraph checkpointer writes to a
+sibling SQLite file (`./sentrik_checkpoints.db`, `SENTINEL_LANGGRAPH_CHECKPOINT_DB`).
+
+Environment variables keep the historical `SENTINEL_` prefix for backward compatibility
+with existing deployments even though the product is named Sentrik.
+
+**What this repository contains.** The public repository ships the application
+(`app/`), container/compose files, `pyproject.toml` and the pinned `requirements.lock`.
+The test suite (134 tests incl. end-to-end runs against a bundled lab target), the
+lab target, benchmark harness, Alembic history, SKILL.md examples and the design/audit
+documents are maintained in the private development tree and are **not published
+here**; statements below about test verification refer to that suite and are not
+reproducible from this repository alone. Request access if you need them.
 
 ### Docker
 
@@ -80,13 +94,25 @@ docker compose up -d --build          # API on :8000, Postgres on :5432
 
 ### Enable live LLM agents (optional)
 
-Without a key, agents use a deterministic fallback brain (fully functional, free).
-With a key, each agent reasons via Anthropic through LangChain:
+**Default is rule-based, not LLM.** Without an API key every agent uses the
+`DeterministicBrain`: a fixed, explainable policy that always picks the first allowed
+action and ranks parameters by a heuristic. All checks, scope enforcement, validation and
+reporting are fully functional in that mode, but `agent.decision` audit rows will show
+`brain_source: deterministic` — they are not model reasoning. With a key, each agent
+reasons via Anthropic through LangChain (`brain_source: llm`):
 
 ```bash
 export SENTINEL_ANTHROPIC_API_KEY=sk-ant-...
-export SENTINEL_ENABLE_LLM_PLANNER=true
+# optional per-assessment spend ceilings (0 = unbounded); when reached, agents degrade
+# to the deterministic brain for the rest of the run (audit shows `budget_exceeded`)
+export SENTINEL_MAX_LLM_TOKENS_PER_ASSESSMENT=200000
+export SENTINEL_MAX_LLM_COST_USD_PER_ASSESSMENT=5
+# optional Deep Agents plan re-ranker (reorder-only; builtin shell/FS tools denied)
+export SENTINEL_USE_DEEPAGENTS_PLANNER=true
 ```
+
+Private deployments can point the brain at an OpenAI-compatible local endpoint instead
+(`SENTINEL_LOCAL_LLM_BASE_URL` + `SENTINEL_LOCAL_LLM_MODEL`).
 
 ---
 
@@ -97,16 +123,32 @@ All settings are environment variables prefixed `SENTINEL_` (see `.env.example` 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SENTINEL_DATABASE_URL` | `sqlite+aiosqlite:///./sentinel.db` | DB (use `postgresql+asyncpg://…` in prod) |
-| `SENTINEL_JWT_SECRET` | dev value | JWT signing key — **set in prod** |
+| `SENTINEL_DATABASE_URL` | `sqlite+aiosqlite:///./sentrik.db` | DB (use `postgresql+asyncpg://…` in prod) |
+| `SENTINEL_JWT_SECRET` | dev value | JWT signing key — **set in prod** (≥16 chars, no placeholder words) |
 | `SENTINEL_SECRET_ENCRYPTION_KEY` | ephemeral | encrypts test-account secrets at rest — **set in prod** |
 | `SENTINEL_ALLOW_PRIVATE_NETWORKS` | `true` | allow RFC1918/loopback targets (set `false` in prod) |
 | `SENTINEL_MAX_REQUESTS_PER_ASSESSMENT` | `5000` | global request ceiling |
+| `SENTINEL_MAX_LLM_TOKENS_PER_ASSESSMENT` / `_MAX_LLM_COST_USD_PER_ASSESSMENT` | `0` (unbounded) | per-run LLM spend ceilings; usage recorded as an `llm.budget` audit event |
+| `SENTINEL_STEP_APPROVAL_REQUIRED` | `true` | hold state-changing/invasive plan steps as `awaiting_approval` until an operator approves each one |
+| `SENTINEL_STEP_APPROVAL_WAIT_SECONDS` | `0` | how long a run waits for approvals before proceeding without the held steps |
+| `SENTINEL_CRAWL_MAX_PAGES` / `_CRAWL_MAX_DEPTH` | `25` / `3` | active-crawl bounds |
 | `SENTINEL_ANTHROPIC_API_KEY` | – | enable live LLM brains |
-| `SENTINEL_USE_LANGGRAPH` | `false` | drive the lifecycle through LangGraph |
+| `SENTINEL_USE_LANGGRAPH` | `false` | drive the lifecycle through LangGraph (durable SQLite checkpointer) |
+| `SENTINEL_USE_DEEPAGENTS_PLANNER` | `false` | Deep Agents re-ranker over the authorized plan |
+| `SENTINEL_STORAGE_BACKEND` | `db` | evidence/report object store: `db`, `local`, or `s3` (S3/MinIO via `SENTINEL_S3_*`) |
+| `SENTINEL_SANDBOX_MODE` | `none` | `none`/`process`/`container` per-run egress sandbox (allow-list independent of ScopeGuard) |
+| `SENTINEL_OIDC_ENABLED` + `SENTINEL_OIDC_ISSUER`/`_AUDIENCE` | `false` | SSO: `POST /v1/onboarding/oidc/login` exchanges a provider ID token for a Sentrik JWT |
 | `SENTINEL_OTLP_ENDPOINT` | – | ship traces to an OTLP collector |
 
-In `production`, Sentrik **fails to start** on insecure default secrets.
+In `production`, Sentrik **fails to start** on insecure or placeholder secrets.
+
+### Per-action approval (state-changing / invasive steps)
+
+Even when an authorization record permits state-changing tests, each such plan step is
+held: `GET /v1/assessments/{id}/steps?status=awaiting_approval` lists them, and
+`POST /v1/assessments/{id}/steps/{step_id}/approve|deny` decides. A step approved after
+the run finished is executed immediately under a fresh scope-guarded client (same record,
+budgets and sandbox), then validated and re-scored.
 
 ---
 

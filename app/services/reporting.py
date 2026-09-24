@@ -12,6 +12,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 
+EMPHASES = ("risk-first", "coverage-first")
+
+
 def build_report_payload(
     *,
     assessment: dict,
@@ -21,7 +24,16 @@ def build_report_payload(
     findings: list[dict],
     coverage: list[dict],
     risk: dict,
+    emphasis: str = "risk-first",
 ) -> dict:
+    """Build the report payload.
+
+    ``emphasis`` is chosen by the ReporterAgent during the run ("risk-first" leads with
+    confirmed findings; "coverage-first" leads with tested/untested surface) and controls
+    section order in the rendered report.
+    """
+    if emphasis not in EMPHASES:
+        emphasis = EMPHASES[0]
     tested = [c for c in coverage if c["tested"]]
     untested = [c for c in coverage if not c["tested"]]
     by_status: dict[str, int] = {}
@@ -31,8 +43,9 @@ def build_report_payload(
         by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
 
     return {
-        "report_version": "1.0",
+        "report_version": "1.1",
         "generated_at": datetime.now(UTC).isoformat(),
+        "emphasis": emphasis,
         "assessment": assessment,
         "target": target,
         "authorization": {
@@ -109,8 +122,20 @@ def render_markdown(payload: dict) -> str:
         f"(by severity: {s['findings_by_severity']})"
     )
     lines.append(f"- By validation status: {s['findings_by_status']}")
+    lines.append(f"- Report emphasis: `{payload.get('emphasis', EMPHASES[0])}`")
     lines.append("")
-    lines.append("## Findings")
+    # Section order follows the ReporterAgent's emphasis decision.
+    if payload.get("emphasis") == "coverage-first":
+        lines.extend(_coverage_section(payload))
+        lines.extend(_findings_section(payload))
+    else:
+        lines.extend(_findings_section(payload))
+        lines.extend(_coverage_section(payload))
+    return "\n".join(lines)
+
+
+def _findings_section(payload: dict) -> list[str]:
+    lines = ["## Findings"]
     if not payload["findings"]:
         lines.append("_No findings recorded._")
     for i, f in enumerate(
@@ -137,15 +162,18 @@ def render_markdown(payload: dict) -> str:
             lines.append(_pretty(repro))
             lines.append("```")
     lines.append("")
-    lines.append("## Coverage")
+    return lines
+
+
+def _coverage_section(payload: dict) -> list[str]:
     cov = payload["coverage"]
-    lines.append(f"- Denominator (endpoint×check pairs): **{cov['denominator']}**")
-    lines.append(
-        f"- Tested: **{cov['tested']}**, Untested: **{cov['untested_count']}**"
-    )
-    lines.append(f"- {cov['note']}")
-    lines.append("")
-    return "\n".join(lines)
+    return [
+        "## Coverage",
+        f"- Denominator (endpoint×check pairs): **{cov['denominator']}**",
+        f"- Tested: **{cov['tested']}**, Untested: **{cov['untested_count']}**",
+        f"- {cov['note']}",
+        "",
+    ]
 
 
 def _pretty(obj: Any) -> str:

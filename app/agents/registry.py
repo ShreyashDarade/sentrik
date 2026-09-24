@@ -78,6 +78,12 @@ def validate_declarative(spec: dict) -> dict:
     for req in _DETECTOR_REQUIRED.get(dtype, []):
         if not det.get(req):
             errors.append(f"detector.{req} is required for type '{dtype}'")
+    # A registrable executable skill must have a real identity (P-10).
+    name = spec.get("name")
+    if not name or name == "unnamed-skill":
+        errors.append("a named 'name' is required")
+    if not spec.get("version"):
+        errors.append("a 'version' is required")
     if not spec.get("check_class"):
         errors.append("check_class is required")
     if spec.get("intensity") not in ("passive", "safe_active", "invasive"):
@@ -217,6 +223,9 @@ def _manifest_to_check(row: AgentSkill) -> DeclarativeCheck | None:
         "remediation": m.get("remediation", ""),
         "detector": m.get("detector"),
         "state_changing": (m.get("policy") or {}).get("state_changing", False),
+        # F-11: carry the declared environment allow-list into the runnable check so the
+        # policy phase can enforce it (e.g. a check that must only run in staging/dev).
+        "allowed_environments": (m.get("policy") or {}).get("environments", []),
     }
     return build_declarative_check(spec)
 

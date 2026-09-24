@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from app.agents.brain import Brain, BrainDecision, BrainTask, get_brain
+from app.agents.budget import get_current_budget
 from app.checks.base import RawFinding
 
 
@@ -84,6 +85,11 @@ class Agent:
 
     async def _consult(self, task: BrainTask, phase: str) -> BrainDecision:
         decision = await self.brain.decide(task)
+        # F-09: every consult counts toward the assessment's decision tally; network
+        # token usage was already recorded by the brain that made the call.
+        budget = get_current_budget()
+        if budget is not None:
+            budget.note_consult()
         self._decisions.append(
             DecisionRecord(
                 agent_id=self.id,

@@ -17,7 +17,7 @@ import logging
 
 from app.checks.base import registry
 
-log = logging.getLogger("sentinel.mcp")
+log = logging.getLogger("sentrik.mcp")
 
 try:
     from mcp.server.mcpserver import MCPServer
@@ -52,6 +52,14 @@ def build_tools() -> list[dict]:
                         "description": "Target URL (must be in scope).",
                     },
                     "method": {"type": "string", "default": "GET"},
+                    "auth_required": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Caller-declared: whether the endpoint requires "
+                            "authentication. Feeds exposure scoring; not verified here."
+                        ),
+                    },
                 },
                 "required": ["authorization_id", "check_name", "url"],
             },
@@ -68,6 +76,7 @@ def build_tools() -> list[dict]:
                     "properties": {
                         "authorization_id": {"type": "string"},
                         "url": {"type": "string"},
+                        "auth_required": {"type": "boolean", "default": False},
                     },
                     "required": ["authorization_id", "url"],
                 },
@@ -77,9 +86,18 @@ def build_tools() -> list[dict]:
 
 
 async def _run_check_bound(
-    authorization_id: str, check_name: str, url: str, method: str = "GET"
+    authorization_id: str,
+    check_name: str,
+    url: str,
+    method: str = "GET",
+    auth_required: bool = False,
 ) -> dict:
-    """Execute one check against a URL under a stored authorization record's scope."""
+    """Execute one check against a URL under a stored authorization record's scope.
+
+    ``auth_required`` is caller-declared (the MCP client knows its endpoint; we do not
+    probe for it here) and is echoed back in the result so consumers can see the
+    assumption that fed exposure scoring.
+    """
     from sqlalchemy import select
 
     from app.checks.context import CheckContext, EndpointView
@@ -118,8 +136,11 @@ async def _run_check_bound(
 
     from urllib.parse import urlsplit
 
+    fingerprint = endpoint_fingerprint(method, url)
     ev = EndpointView(
-        id="mcp",
+        # Ad-hoc (non-persisted) endpoint: identify it by its own fingerprint so results
+        # from different URLs are distinguishable, rather than a fixed label.
+        id=f"adhoc-{fingerprint[:16]}",
         method=method.upper(),
         url=url,
         path_template=templatize_path(urlsplit(url).path or "/"),
@@ -128,32 +149,58 @@ async def _run_check_bound(
             for k in _query_keys(url)
         ],
         request_body_schema={},
-        auth_required=False,
-        fingerprint=endpoint_fingerprint(method, url),
+        auth_required=bool(auth_required),
+        fingerprint=fingerprint,
     )
     findings_out = []
+    applied = False
     try:
         async with GuardedHttpClient(guard) as client:
             ctx = CheckContext(
                 client=client, endpoint=ev, intensity=check.intensity, base_url=url
             )
-            if await check.applies_to(ctx):
+            applied = await check.applies_to(ctx)
+            if applied:
                 for f in await check.run(ctx):
-                    findings_out.append(
-                        {
-                            "title": f.title,
-                            "severity": f.severity.value,
-                            "confidence": f.confidence.value,
-                            "cwe": f.cwe,
-                        }
-                    )
+                    findings_out.append(_finding_payload(f))
     except ScopeViolation as exc:
         return {"error": f"scope violation: {exc.reason}"}
     return {
         "check": check_name,
         "url": url,
+        "endpoint_id": ev.id,
+        "applicable": applied,
+        "auth_required_declared": bool(auth_required),
         "findings": findings_out,
         "requests_made": guard.requests_made,
+    }
+
+
+def _finding_payload(f) -> dict:
+    """Serialize a RawFinding for MCP callers *with* its proof.
+
+    Evidence is already redacted by ``build_evidence_exchange`` at capture time; the
+    reproduction recipe lets the caller (or Sentrik's validator) re-run the exact probe.
+    """
+    return {
+        "title": f.title,
+        "severity": f.severity.value,
+        "confidence": f.confidence.value,
+        "cwe": f.cwe,
+        "check_class": f.check_class,
+        "description": f.description,
+        "remediation": f.remediation,
+        "endpoint_url": f.endpoint_url,
+        "reproduction": dict(f.reproduction or {}),
+        "evidence": [
+            {
+                "kind": e.kind,
+                "note": e.note,
+                "request": dict(getattr(e, "request", {}) or {}),
+                "response": dict(getattr(e, "response", {}) or {}),
+            }
+            for e in (f.evidence or [])
+        ],
     }
 
 
@@ -168,16 +215,22 @@ def build_server():
     per check; every tool is bound to a stored authorization record's scope."""
     if not MCP_AVAILABLE:
         raise RuntimeError("mcp package not installed")
-    server = MCPServer("sentinel-security")
+    server = MCPServer("sentrik-security")
 
     @server.tool(
         name="run_check",
         description="Run a named security check against a URL within an authorized scope.",
     )
     async def run_check(
-        authorization_id: str, check_name: str, url: str, method: str = "GET"
+        authorization_id: str,
+        check_name: str,
+        url: str,
+        method: str = "GET",
+        auth_required: bool = False,
     ) -> dict:
-        return await _run_check_bound(authorization_id, check_name, url, method)
+        return await _run_check_bound(
+            authorization_id, check_name, url, method, auth_required
+        )
 
     # one thin tool per registered check
     for c in registry.all():
@@ -191,8 +244,12 @@ def build_server():
 def _register_check_tool(
     server, check_name: str, check_class: str, intensity: str, cwe: str
 ):
-    async def _tool(authorization_id: str, url: str) -> dict:
-        return await _run_check_bound(authorization_id, check_name, url)
+    async def _tool(
+        authorization_id: str, url: str, auth_required: bool = False
+    ) -> dict:
+        return await _run_check_bound(
+            authorization_id, check_name, url, auth_required=auth_required
+        )
 
     _tool.__name__ = f"check_{check_name.replace('.', '_')}"
     server.tool(

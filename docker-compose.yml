@@ -1,14 +1,16 @@
 services:
   db:
     image: postgres:16-alpine
+    # DB credentials come from the environment; no hardcoded password (P-14).
+    #   export SENTRIK_DB_USER=sentrik SENTRIK_DB_PASSWORD=$(openssl rand -hex 24) SENTRIK_DB_NAME=sentrik
     environment:
-      POSTGRES_USER: sentinel
-      POSTGRES_PASSWORD: sentinel
-      POSTGRES_DB: sentinel
+      POSTGRES_USER: ${SENTRIK_DB_USER:-sentrik}
+      POSTGRES_PASSWORD: ${SENTRIK_DB_PASSWORD:?set SENTRIK_DB_PASSWORD}
+      POSTGRES_DB: ${SENTRIK_DB_NAME:-sentrik}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      test: ["CMD-SHELL", "pg_isready -U ${SENTRIK_DB_USER:-sentrik}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -21,7 +23,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@db:5432/sentinel
+      SENTINEL_DATABASE_URL: postgresql+asyncpg://${SENTRIK_DB_USER:-sentrik}:${SENTRIK_DB_PASSWORD:?set SENTRIK_DB_PASSWORD}@db:5432/${SENTRIK_DB_NAME:-sentrik}
       # No insecure defaults: compose fails if these are unset (F-02). Generate with:
       #   export SENTINEL_JWT_SECRET=$(openssl rand -hex 32)
       #   export SENTINEL_SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)
@@ -31,7 +33,6 @@ services:
       SENTINEL_ALLOW_PRIVATE_NETWORKS: "false"
       # Optional: enable real LLM brains for the agent pool
       SENTINEL_ANTHROPIC_API_KEY: ${SENTINEL_ANTHROPIC_API_KEY:-}
-      SENTINEL_ENABLE_LLM_PLANNER: ${SENTINEL_ENABLE_LLM_PLANNER:-false}
     # The app creates its schema on startup (init_db); no migration step required.
     command: >
       sh -c "gunicorn app.main:app -k uvicorn.workers.UvicornWorker

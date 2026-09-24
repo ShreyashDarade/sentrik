@@ -19,7 +19,9 @@ from app.api.schemas import (
     EndpointOut,
     EvidenceOut,
     FindingOut,
+    PlanStepOut,
     RetestCreate,
+    StepDecision,
 )
 from app.core.auth import Principal, get_principal, require_role
 from app.core.db import get_session, get_sessionmaker
@@ -493,6 +495,128 @@ async def cancel(
 
 
 # --------------------------------------------------------------------------- #
+# plan steps + per-action approval (CP-03)
+# --------------------------------------------------------------------------- #
+def _step_out(s: PlanStep) -> PlanStepOut:
+    return PlanStepOut(
+        id=s.id,
+        assessment_id=s.assessment_id,
+        endpoint_id=s.endpoint_id,
+        check_class=s.check_class,
+        check_name=s.check_name,
+        intensity=s.intensity,
+        priority=s.priority,
+        status=s.status,
+        rationale=s.rationale or "",
+        policy_decision=s.policy_decision or {},
+    )
+
+
+@router.get("/assessments/{assessment_id}/steps", response_model=list[PlanStepOut])
+async def list_steps(
+    assessment_id: str,
+    status: str | None = Query(default=None),
+    principal: Principal = Depends(get_principal),
+    session: AsyncSession = Depends(get_session),
+):
+    """List plan steps; filter with ``?status=awaiting_approval`` to see held actions."""
+    await _get_assessment(session, principal, assessment_id)
+    stmt = select(PlanStep).where(PlanStep.assessment_id == assessment_id)
+    if status:
+        stmt = stmt.where(PlanStep.status == status)
+    rows = (await session.execute(stmt.order_by(PlanStep.priority))).scalars().all()
+    return [_step_out(s) for s in rows]
+
+
+async def _held_step(session, principal, assessment_id, step_id) -> PlanStep:
+    await _get_assessment(session, principal, assessment_id)
+    step = await session.get(PlanStep, step_id)
+    if not step or step.assessment_id != assessment_id:
+        raise HTTPException(status_code=404, detail="plan step not found")
+    if step.status != "awaiting_approval":
+        raise HTTPException(
+            status_code=409, detail=f"step is {step.status}, not awaiting_approval"
+        )
+    return step
+
+
+@router.post(
+    "/assessments/{assessment_id}/steps/{step_id}/approve",
+    response_model=PlanStepOut,
+)
+async def approve_step(
+    assessment_id: str,
+    step_id: str,
+    body: StepDecision | None = None,
+    principal: Principal = Depends(require_role(Role.OPERATOR)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Approve one held state-changing/invasive step (CP-03).
+
+    While the assessment is still running, the engine's bounded approval wait picks the
+    step up. If the run has already finished, the step is executed now in the background
+    under a fresh scope-guarded client (same authorization record, budgets and sandbox),
+    followed by independent validation and re-scoring.
+    """
+    step = await _held_step(session, principal, assessment_id, step_id)
+    a = await session.get(Assessment, assessment_id)
+    step.status = "approved"
+    step.policy_decision = {
+        **(step.policy_decision or {}),
+        "approved_by": principal.user_id,
+        "approval_note": (body.note if body else ""),
+    }
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        assessment_id=assessment_id,
+        actor=principal.user_id,
+        event="step.approved",
+        data={"step_id": step_id, "check_name": step.check_name, "note": body.note if body else ""},
+    )
+    await session.commit()
+    await session.refresh(step)
+    if a.state in (
+        AssessmentState.COMPLETED.value,
+        AssessmentState.CANCELLED.value,
+        AssessmentState.FAILED.value,
+    ):
+        orchestrator.start_approved_steps(assessment_id, [step_id])
+    return _step_out(step)
+
+
+@router.post(
+    "/assessments/{assessment_id}/steps/{step_id}/deny",
+    response_model=PlanStepOut,
+)
+async def deny_step(
+    assessment_id: str,
+    step_id: str,
+    body: StepDecision | None = None,
+    principal: Principal = Depends(require_role(Role.OPERATOR)),
+    session: AsyncSession = Depends(get_session),
+):
+    step = await _held_step(session, principal, assessment_id, step_id)
+    step.status = "denied"
+    step.policy_decision = {
+        **(step.policy_decision or {}),
+        "denied_by": principal.user_id,
+        "denial_note": (body.note if body else ""),
+    }
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        assessment_id=assessment_id,
+        actor=principal.user_id,
+        event="step.denied",
+        data={"step_id": step_id, "check_name": step.check_name},
+    )
+    await session.commit()
+    await session.refresh(step)
+    return _step_out(step)
+
+
+# --------------------------------------------------------------------------- #
 # artifacts / endpoints / findings / evidence / coverage
 # --------------------------------------------------------------------------- #
 @router.get("/assessments/{assessment_id}/artifacts", response_model=list[ArtifactOut])
@@ -716,6 +840,7 @@ async def report(
     )
 
     payload = reporting.build_report_payload(
+        emphasis=(a.summary or {}).get("report_emphasis", reporting.EMPHASES[0]),
         assessment={
             "id": a.id,
             "state": a.state,
@@ -777,6 +902,47 @@ async def report(
             },
         )
     return payload
+
+
+@router.post("/assessments/{assessment_id}/report/export")
+async def export_report(
+    assessment_id: str,
+    fmt: str = Query(default="pdf"),
+    principal: Principal = Depends(require_role(Role.OPERATOR)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Render the report and store it via the configured object-storage backend
+    (db/local/s3). Returns a persistable ObjectRef the caller can keep."""
+    from app.services.storage import get_storage
+
+    # reuse the report renderer
+    payload = await report(assessment_id, fmt="json", principal=principal, session=session)
+    if fmt == "markdown":
+        data = reporting.render_markdown(payload).encode()
+        content_type = "text/markdown"
+    elif fmt == "pdf":
+        from app.services.pdf_report import text_to_pdf
+
+        data = text_to_pdf(reporting.render_markdown(payload))
+        content_type = "application/pdf"
+    else:
+        import json as _json
+
+        data = _json.dumps(payload, default=str).encode()
+        content_type = "application/json"
+    storage = get_storage()
+    ref = await storage.put(
+        f"reports/{assessment_id}/report.{fmt}", data, content_type=content_type
+    )
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        assessment_id=assessment_id,
+        event="report.exported",
+        data={"backend": ref["backend"], "fmt": fmt, "url": ref.get("url")},
+    )
+    await session.commit()
+    return {"stored": True, "ref": ref}
 
 
 @router.get("/assessments/{assessment_id}/attack-path")

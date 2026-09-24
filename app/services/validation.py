@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass
 
 from app.checks.sqli import DB_ERROR_SIGNATURES
+from app.checks.xss import renderable_html_context
 from app.core.enums import FindingStatus
 from app.security.http_client import GuardedHttpClient, TargetUnreachable
 from app.security.scope import ScopeViolation
@@ -37,7 +38,15 @@ async def validate_finding(
     *,
     check_class: str,
     reproduction: dict,
+    sessions: list | None = None,
 ) -> ValidationOutcome:
+    """Independently re-prove a finding from its reproduction recipe.
+
+    ``sessions`` (CP-04) are the assessment's *authenticated test-account sessions*
+    (``AuthSession``: role_name, headers, expired). They are handed to validators whose
+    proof is inherently session-relative — BOLA needs to act *as the attacker role* named
+    in the recipe. The validator still never sees the original evidence or conclusion.
+    """
     if not reproduction:
         return ValidationOutcome(
             FindingStatus.INCONCLUSIVE,
@@ -45,13 +54,15 @@ async def validate_finding(
             "finding has no reproduction recipe",
         )
     try:
+        if check_class == "bola":
+            return await _validate_bola(client, reproduction, sessions or [])
         dispatch = {
             "sqli": _validate_sqli,
             "xss": _validate_xss,
-            "bola": _validate_bola,
             "open_redirect": _validate_open_redirect,
             "security_headers": _validate_headers,
             "info_disclosure": _validate_headers,
+            "business_logic": _validate_business_logic,
         }.get(check_class)
         if dispatch is None:
             # Declarative checks (arbitrary check_class) validate by their detector type.
@@ -141,10 +152,19 @@ async def _validate_xss(client, repro) -> ValidationOutcome:
     raw = f"<szx{marker}>" if marker else payload
     escaped = f"&lt;szx{marker}&gt;" if marker else ""
     if raw and raw in resp.text and (not escaped or escaped not in resp.text):
+        ctype = resp.headers.get("content-type", "")
+        if not renderable_html_context(resp.status_code, ctype):
+            return ValidationOutcome(
+                FindingStatus.REJECTED,
+                "independent_replay",
+                f"reflection is in a non-renderable context "
+                f"(status {resp.status_code}, content-type {ctype!r}); not executable",
+                evidence=_ev(resp),
+            )
         return ValidationOutcome(
             FindingStatus.CONFIRMED,
             "independent_replay",
-            "unescaped reflection reproduced",
+            "unescaped reflection reproduced in an HTML response",
             evidence=_ev(resp),
         )
     if escaped and escaped in resp.text:
@@ -158,31 +178,132 @@ async def _validate_xss(client, repro) -> ValidationOutcome:
     )
 
 
-async def _validate_bola(client, repro) -> ValidationOutcome:
-    # We do not carry attacker session headers into validation (controlled access),
-    # so we can only confirm that the object endpoint responds; a full re-proof requires
-    # the session context, which the validator intentionally lacks. Mark suspected.
+async def _validate_bola(client, repro, sessions: list) -> ValidationOutcome:
+    """Session-aware BOLA re-proof (CP-04).
+
+    The recipe names the attacker/victim roles and the victim's object id. Using the
+    assessment's own test-account session for the *attacker role*, the request is
+    re-issued; CONFIRMED requires a 200 referencing the object id while the same request
+    without any session does not (so the object is not simply public). Without a usable
+    attacker session the outcome stays SUSPECTED (controlled evidence access).
+    """
     url = repro.get("url")
     obj = str(repro.get("object_id", ""))
+    attacker_role = str(repro.get("attacker_role", ""))
+    if not url or not obj:
+        return ValidationOutcome(
+            FindingStatus.INCONCLUSIVE, "no_recipe", "bola recipe incomplete"
+        )
+    attacker = next(
+        (
+            s
+            for s in sessions
+            if getattr(s, "role_name", None) == attacker_role
+            and not getattr(s, "expired", False)
+        ),
+        None,
+    )
     try:
         anon = await client.get(url)
     except TargetUnreachable:
         return ValidationOutcome(
             FindingStatus.INCONCLUSIVE, "unreachable", "object endpoint unreachable"
         )
-    if anon.status_code == 200 and obj and obj in anon.text:
-        # object is reachable without any auth → even worse, but different class; confirm exposure
+    if anon.status_code == 200 and obj in anon.text:
+        # reachable with no session at all: exposure is real (and broader than BOLA)
         return ValidationOutcome(
             FindingStatus.CONFIRMED,
             "anon_access",
             "object retrievable without authentication",
             evidence=_ev(anon),
         )
+    if attacker is None:
+        return ValidationOutcome(
+            FindingStatus.SUSPECTED,
+            "controlled_access",
+            f"no active session for attacker role {attacker_role!r}; "
+            "cross-account re-proof not possible",
+        )
+    try:
+        as_attacker = await client.get(url, headers=dict(attacker.headers))
+    except TargetUnreachable:
+        return ValidationOutcome(
+            FindingStatus.INCONCLUSIVE, "unreachable", "object endpoint unreachable"
+        )
+    if as_attacker.status_code == 200 and obj in as_attacker.text:
+        return ValidationOutcome(
+            FindingStatus.CONFIRMED,
+            "cross_account_session",
+            f"role {attacker_role!r} retrieved object {obj} owned by "
+            f"{repro.get('victim_role', '?')!r}; anonymous request did not",
+            evidence=_ev(as_attacker),
+        )
+    if as_attacker.status_code in (401, 403, 404):
+        return ValidationOutcome(
+            FindingStatus.REJECTED,
+            "cross_account_session",
+            f"object not returned to role {attacker_role!r} "
+            f"(status {as_attacker.status_code})",
+            evidence=_ev(as_attacker),
+        )
+    return ValidationOutcome(
+        FindingStatus.INCONCLUSIVE,
+        "cross_account_session",
+        f"unexpected status {as_attacker.status_code} during re-proof",
+        evidence=_ev(as_attacker),
+    )
+
+
+async def _validate_business_logic(client, repro) -> ValidationOutcome:
+    """Re-prove a numeric-bounds business-logic finding (CP-01).
+
+    Recipe: {method,url,param,payload(out-of-range value),baseline_value,echo}. The
+    server must (a) accept the out-of-range value with a 2xx and (b) echo it back in the
+    body (the value was *applied*, not silently clamped) while (c) the baseline value is
+    also accepted — establishing that the acceptance is real behaviour, not a flap.
+    """
+    url, param = repro.get("url"), repro.get("param")
+    payload = str(repro.get("payload", ""))
+    baseline_value = str(repro.get("baseline_value", "1"))
+    method = str(repro.get("method", "GET")).upper()
+    if not url or not param:
+        return ValidationOutcome(
+            FindingStatus.INCONCLUSIVE, "no_recipe", "business-logic recipe incomplete"
+        )
+    baseline = await _send(client, method, url, {param: baseline_value})
+    probe = await _send(client, method, url, {param: payload})
+    if not (200 <= baseline.status_code < 300):
+        return ValidationOutcome(
+            FindingStatus.INCONCLUSIVE,
+            "numeric_bounds",
+            f"baseline value rejected with {baseline.status_code}; cannot compare",
+            evidence=_ev(baseline),
+        )
+    if 200 <= probe.status_code < 300 and _echoes_value(probe.text, payload):
+        return ValidationOutcome(
+            FindingStatus.CONFIRMED,
+            "numeric_bounds",
+            f"out-of-range value {payload!r} for {param!r} accepted and applied",
+            evidence=_ev(probe),
+        )
+    if probe.status_code >= 400:
+        return ValidationOutcome(
+            FindingStatus.REJECTED,
+            "numeric_bounds",
+            f"out-of-range value now rejected ({probe.status_code})",
+            evidence=_ev(probe),
+        )
     return ValidationOutcome(
         FindingStatus.SUSPECTED,
-        "controlled_access",
-        "cross-account proof requires session context withheld from validator",
+        "numeric_bounds",
+        "value accepted but not observably applied in the response",
+        evidence=_ev(probe),
     )
+
+
+def _echoes_value(body: str, value: str) -> bool:
+    """True if the numeric value appears in the body as a standalone number token."""
+    return re.search(rf"(?<![\w.-]){re.escape(value)}(?![\w.])", body or "") is not None
 
 
 async def _validate_open_redirect(client, repro) -> ValidationOutcome:
@@ -308,15 +429,25 @@ async def _validate_declarative(client, repro) -> ValidationOutcome:
         )
 
     if detector == "reflection":
-        marker = repro.get("marker", "")
-        resp = await _send(client, method, url, {param: repro.get("payload", "")})
-        raw = f"<zzz{marker}>" if marker else repro.get("payload", "")
+        # Use the exact payload the check sent (honors any manifest marker_template) —
+        # do not reconstruct a hardcoded marker shape (P-08).
+        raw = repro.get("payload", "")
+        resp = await _send(client, method, url, {param: raw})
         escaped = raw.replace("<", "&lt;").replace(">", "&gt;")
         if raw and raw in resp.text and (escaped == raw or escaped not in resp.text):
+            ctype = resp.headers.get("content-type", "")
+            if not renderable_html_context(resp.status_code, ctype):
+                return ValidationOutcome(
+                    FindingStatus.REJECTED,
+                    "reflection",
+                    f"reflection is in a non-renderable context "
+                    f"(status {resp.status_code}, content-type {ctype!r})",
+                    evidence=_ev(resp),
+                )
             return ValidationOutcome(
                 FindingStatus.CONFIRMED,
                 "reflection",
-                "unescaped reflection reproduced",
+                "unescaped reflection reproduced in an HTML response",
                 evidence=_ev(resp),
             )
         return ValidationOutcome(

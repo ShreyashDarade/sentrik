@@ -3,7 +3,13 @@
 from app.discovery.normalize import (
     DiscoveredEndpoint,
     endpoint_fingerprint,
+    endpoint_surface_signature,
     merge_endpoints,
 )
 
-__all__ = ["DiscoveredEndpoint", "endpoint_fingerprint", "merge_endpoints"]
+__all__ = [
+    "DiscoveredEndpoint",
+    "endpoint_fingerprint",
+    "endpoint_surface_signature",
+    "merge_endpoints",
+]

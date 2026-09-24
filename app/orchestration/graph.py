@@ -15,9 +15,13 @@ the graph only sequences work.
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import asynccontextmanager
 from typing import TypedDict
 
-log = logging.getLogger("sentinel.graph")
+from app.core.config import get_settings
+
+log = logging.getLogger("sentrik.graph")
 
 try:  # optional dependency
     from langgraph.checkpoint.memory import MemorySaver
@@ -27,6 +31,52 @@ try:  # optional dependency
 except Exception:  # noqa: BLE001  pragma: no cover
     LANGGRAPH_AVAILABLE = False
 
+try:  # durable checkpointer (crash-recoverable run state); optional
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    SQLITE_CHECKPOINTER_AVAILABLE = True
+except Exception:  # noqa: BLE001  pragma: no cover
+    SQLITE_CHECKPOINTER_AVAILABLE = False
+
+
+def _checkpoint_db_path() -> str:
+    """Resolve the SQLite file that backs the durable checkpointer.
+
+    Uses ``langgraph_checkpoint_db`` when set; otherwise derives a sibling file next to
+    the sqlite application database, else a local default.
+    """
+    settings = get_settings()
+    configured = (settings.langgraph_checkpoint_db or "").strip()
+    if configured:
+        return configured
+    url = settings.database_url or ""
+    if url.startswith("sqlite") and "///" in url:
+        db_file = url.split("///", 1)[1]
+        if db_file and db_file != ":memory:":
+            base, _ext = os.path.splitext(db_file)
+            return f"{base}_checkpoints.db"
+    return "./sentrik_checkpoints.db"
+
+
+@asynccontextmanager
+async def checkpointer_cm():
+    """Yield a LangGraph checkpointer, durable (AsyncSqliteSaver) when available.
+
+    The durable saver persists every node transition to SQLite, so an interrupted run's
+    state survives a process crash and can be resumed on the same ``thread_id``. When the
+    sqlite checkpointer package is not installed we fall back to the in-memory saver, which
+    still gives correct single-process orchestration but no crash recovery.
+    """
+    if SQLITE_CHECKPOINTER_AVAILABLE:
+        path = _checkpoint_db_path()
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        async with AsyncSqliteSaver.from_conn_string(path) as saver:
+            yield saver
+    else:  # pragma: no cover - exercised only without the sqlite extra installed
+        yield MemorySaver()
+
 
 class AssessmentGraphState(TypedDict, total=False):
     assessment_id: str
@@ -35,8 +85,12 @@ class AssessmentGraphState(TypedDict, total=False):
     last_phase: str
 
 
-def build_assessment_graph(engine):
-    """Compile a LangGraph workflow bound to a specific AssessmentEngine instance."""
+def build_assessment_graph(engine, checkpointer=None):
+    """Compile a LangGraph workflow bound to a specific AssessmentEngine instance.
+
+    ``checkpointer`` is the durable/in-memory saver the compiled graph persists state to;
+    when omitted an in-memory ``MemorySaver`` is used (single-run, no crash recovery).
+    """
     if not LANGGRAPH_AVAILABLE:
         raise RuntimeError("langgraph is not installed")
 
@@ -112,20 +166,30 @@ def build_assessment_graph(engine):
     )
     graph.add_edge("report", END)
 
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
 async def run_via_langgraph(assessment_id: str) -> None:
     """Run one assessment through the LangGraph workflow."""
     from app.orchestration.engine import AssessmentEngine
 
+    from app.agents.budget import reset_current_budget, set_current_budget
+
     engine = AssessmentEngine(assessment_id)
-    compiled = build_assessment_graph(engine)
     config = {"configurable": {"thread_id": assessment_id}}
-    final = await compiled.ainvoke(
-        {"assessment_id": assessment_id, "status": "running"}, config
-    )
-    status = final.get("status")
-    if status == "cancelled":
-        await engine._finish_cancelled()
-    # failed/completed already persisted by the nodes
+    # F-09: the durable-workflow path drives phases directly (not via engine.run), so the
+    # LLM token/cost ledger must be installed here too.
+    budget_token = set_current_budget(engine.llm_budget)
+    try:
+        async with checkpointer_cm() as checkpointer:
+            compiled = build_assessment_graph(engine, checkpointer=checkpointer)
+            final = await compiled.ainvoke(
+                {"assessment_id": assessment_id, "status": "running"}, config
+            )
+        status = final.get("status")
+        if status == "cancelled":
+            await engine._finish_cancelled()
+        # failed/completed already persisted by the nodes
+    finally:
+        reset_current_budget(budget_token)
+        await engine._persist_llm_budget()

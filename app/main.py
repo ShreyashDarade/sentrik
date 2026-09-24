@@ -1,4 +1,4 @@
-"""Sentinel API application factory and wiring."""
+"""Sentrik API application factory and wiring."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ configure_logging(
         or _settings.environment == "production"
     )
 )
-log = logging.getLogger("sentinel")
+log = logging.getLogger("sentrik")
 
 
 @asynccontextmanager
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
             log.info("resumed %d interrupted assessment(s): %s", len(resumed), resumed)
     except Exception:
         log.warning("assessment resume sweep skipped", exc_info=True)
-    log.info("Sentinel %s started (env=%s)", __version__, get_settings().environment)
+    log.info("Sentrik %s started (env=%s)", __version__, get_settings().environment)
     yield
 
 
