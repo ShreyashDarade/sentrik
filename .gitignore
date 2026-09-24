@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenv (never commit)
+.venv/
+venv/
+env/
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\.pytest_cache
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\.ruff_cache
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\.venv
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\audit
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\benchmarks
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\migrations
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\scripts
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\skills
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\tests
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\vulnapp
+C:\Users\shrey\OneDrive - Inspironlabs Software systems private limited\Desktop\cybersecurity\docs
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Secrets / local env (never commit)
+.env
+*.pem
+*.key
+
+# Databases / local run artifacts
+*.db
+*.db-wal
+*.db-shm
+sentinel.db*
+_live*.db*
+_m*.db*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+
+# Internal QA/process artifacts (not shipped)
+audit/
+
+# Excluded from the published repo (kept locally): aux/dev folders
+tests/
+docs/
+migrations/
+scripts/
+skills/
+benchmarks/
+vulnapp/
+alembic.ini

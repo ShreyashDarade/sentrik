@@ -1,0 +1,339 @@
+"""Agent brains.
+
+`Brain` is the reasoning interface every agent uses. Two implementations:
+
+  * LLMBrain          — calls the Anthropic Messages API and parses a JSON decision.
+  * DeterministicBrain — a rule-based brain implementing the identical interface,
+                         used automatically when no API key is set (keeps the platform
+                         runnable and end-to-end testable without external calls).
+
+`get_brain()` returns an LLMBrain when an Anthropic key is configured, else a
+DeterministicBrain. Both are bounded: token/step budgets are enforced by callers.
+Brains only ever RANK, SELECT-AMONG-ALLOWED, or HYPOTHESIZE. They never receive the
+authorization record or secrets, and their output is treated as untrusted: callers
+validate every field against the deterministic policy before acting on it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+
+from app.core.config import get_settings
+
+log = logging.getLogger("sentinel.brain")
+
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+@dataclass
+class BrainTask:
+    role: str  # agent role, e.g. "sqli-specialist"
+    instruction: str  # what to decide
+    context: dict = field(default_factory=dict)  # untrusted facts (endpoint, signals)
+    allowed_actions: list[str] = field(
+        default_factory=list
+    )  # closed set the brain may pick from
+    max_tokens: int = 512
+
+
+@dataclass
+class BrainDecision:
+    action: str  # chosen action (validated by caller against allowed_actions)
+    reasoning: str  # short rationale (for audit trail)
+    params: dict = field(default_factory=dict)
+    source: str = "deterministic"  # "llm" | "deterministic" | "llm_fallback"
+    confidence: float = 0.6
+
+
+class Brain:
+    kind = "base"
+
+    async def decide(self, task: BrainTask) -> BrainDecision:  # pragma: no cover
+        raise NotImplementedError
+
+
+class DeterministicBrain(Brain):
+    """Rule-based brain. Deterministic, offline, and safe by construction."""
+
+    kind = "deterministic"
+
+    async def decide(self, task: BrainTask) -> BrainDecision:
+        action = task.allowed_actions[0] if task.allowed_actions else "proceed"
+        # Simple, explainable heuristics keyed by role.
+        ctx = task.context
+        params: dict[str, Any] = {}
+        reasoning = f"deterministic policy for {task.role}: default to '{action}'"
+
+        if task.role.endswith("specialist"):
+            # prioritize parameters that look injectable
+            params["param_order"] = _rank_params(ctx.get("parameters", []))
+            reasoning = "ranked parameters by injectability heuristic"
+        elif task.role == "planner":
+            params["strategy"] = "coverage-first"
+        elif task.role == "coordinator":
+            # choose whether to continue based on remaining budget/signal
+            if ctx.get("budget_remaining", 1) <= 0:
+                action = "stop" if "stop" in task.allowed_actions else action
+                reasoning = "budget exhausted"
+        elif task.role == "validator":
+            params["independent"] = True
+        return BrainDecision(
+            action=action,
+            reasoning=reasoning,
+            params=params,
+            source="deterministic",
+            confidence=0.6,
+        )
+
+
+_SYSTEM_PROMPT = (
+    "You are a bounded reasoning module inside an AUTHORIZED security-testing "
+    "platform. You only choose among the explicitly allowed actions and propose "
+    "parameters. You never invent targets, never request out-of-scope hosts, and "
+    "never attempt to change authorization. Respond ONLY with compact JSON: "
+    '{"action": <one of allowed_actions>, "reasoning": <=280 chars, '
+    '"params": {..}, "confidence": 0..1}.'
+)
+
+
+def _langchain_client(model: str, api_key: str):
+    """Return a LangChain ChatAnthropic client if langchain-anthropic is available."""
+    try:
+        from langchain_anthropic import ChatAnthropic
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return ChatAnthropic(model=model, api_key=api_key, max_tokens=512, timeout=30)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class LLMBrain(Brain):
+    """Anthropic-backed brain. Uses LangChain's ChatAnthropic when available (framework
+    integration), else the raw Messages API. Falls back to DeterministicBrain on any error."""
+
+    kind = "llm"
+
+    def __init__(self, api_key: str, model: str, *, prefer_langchain: bool = True):
+        self._api_key = api_key
+        self._model = model
+        self._fallback = DeterministicBrain()
+        self._lc = _langchain_client(model, api_key) if prefer_langchain else None
+        self.transport = "langchain" if self._lc is not None else "httpx"
+
+    async def decide(self, task: BrainTask) -> BrainDecision:
+        user = json.dumps(
+            {
+                "role": task.role,
+                "instruction": task.instruction,
+                "allowed_actions": task.allowed_actions,
+                "context": _truncate_context(task.context),
+            }
+        )
+        try:
+            if self._lc is not None:
+                text = await self._decide_langchain(user)
+            else:
+                text = await self._decide_httpx(user, task.max_tokens)
+            decision = _parse_decision(text)
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            log.warning("LLM brain error (%s); falling back", exc)
+            return await self._fallback_with_source(task)
+        except Exception as exc:  # noqa: BLE001  langchain raises varied types
+            log.warning("LLM brain (langchain) error (%s); falling back", exc)
+            return await self._fallback_with_source(task)
+
+        # Validate the LLM's chosen action against the closed allowed set.
+        if task.allowed_actions and decision.action not in task.allowed_actions:
+            decision.action = task.allowed_actions[0]
+            decision.reasoning = "[coerced to allowed] " + decision.reasoning
+        decision.source = "llm"
+        return decision
+
+    async def _decide_langchain(self, user: str) -> str:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        resp = await self._lc.ainvoke(
+            [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=user)]
+        )
+        content = resp.content
+        if isinstance(content, list):  # some providers return content blocks
+            content = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+            )
+        return str(content)
+
+    async def _decide_httpx(self, user: str, max_tokens: int) -> str:
+        payload = {
+            "model": self._model,
+            "max_tokens": max_tokens,
+            "system": _SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user}],
+        }
+        headers = {
+            "x-api-key": self._api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(ANTHROPIC_URL, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            raise httpx.HTTPError(f"LLM brain HTTP {resp.status_code}")
+        return _extract_text(resp.json())
+
+    async def _fallback_with_source(self, task: BrainTask) -> BrainDecision:
+        d = await self._fallback.decide(task)
+        d.source = "llm_fallback"
+        return d
+
+
+class LocalLLMBrain(Brain):
+    """Private-deployment brain: an OpenAI-compatible local endpoint (vLLM/Ollama/LM Studio).
+
+    Keeps inference on-prem (no data leaves the network). Falls back to DeterministicBrain
+    on any error. Selected when SENTINEL_LOCAL_LLM_BASE_URL is set.
+    """
+
+    kind = "local_llm"
+
+    def __init__(self, base_url: str, model: str, api_key: str = "local"):
+        self._url = base_url.rstrip("/") + "/chat/completions"
+        self._model = model
+        self._api_key = api_key
+        self._fallback = DeterministicBrain()
+        self.transport = "openai_compatible"
+
+    async def decide(self, task: BrainTask) -> BrainDecision:
+        user = json.dumps(
+            {
+                "role": task.role,
+                "instruction": task.instruction,
+                "allowed_actions": task.allowed_actions,
+                "context": _truncate_context(task.context),
+            }
+        )
+        payload = {
+            "model": self._model,
+            "max_tokens": task.max_tokens,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    self._url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                )
+            if resp.status_code >= 400:
+                raise httpx.HTTPError(f"local LLM HTTP {resp.status_code}")
+            text = resp.json()["choices"][0]["message"]["content"]
+            decision = _parse_decision(text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("local LLM brain error (%s); falling back", exc)
+            d = await self._fallback.decide(task)
+            d.source = "local_llm_fallback"
+            return d
+        if task.allowed_actions and decision.action not in task.allowed_actions:
+            decision.action = task.allowed_actions[0]
+        decision.source = "local_llm"
+        return decision
+
+
+_singleton: Brain | None = None
+
+
+def get_brain() -> Brain:
+    """Return the configured brain.
+
+    Priority: local self-hosted endpoint (private deployment) → Anthropic (LangChain/raw)
+    → deterministic fallback (offline, always available).
+    """
+    global _singleton
+    if _singleton is not None:
+        return _singleton
+    s = get_settings()
+    if s.local_llm_base_url and s.local_llm_model:
+        _singleton = LocalLLMBrain(
+            s.local_llm_base_url, s.local_llm_model, s.local_llm_api_key
+        )
+    elif s.anthropic_api_key:
+        _singleton = LLMBrain(
+            s.anthropic_api_key, s.planner_model, prefer_langchain=s.use_langchain_brain
+        )
+    else:
+        _singleton = DeterministicBrain()
+    return _singleton
+
+
+def reset_brain() -> None:
+    global _singleton
+    _singleton = None
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _rank_params(params: list[dict]) -> list[str]:
+    def score(p: dict) -> int:
+        name = p.get("name", "").lower()
+        s = 0
+        if any(
+            h in name for h in ("id", "user", "search", "q", "query", "name", "email")
+        ):
+            s += 3
+        if p.get("in") in ("query", "body"):
+            s += 1
+        return s
+
+    return [
+        p.get("name", "")
+        for p in sorted(params, key=score, reverse=True)
+        if p.get("name")
+    ]
+
+
+def _truncate_context(ctx: dict, limit: int = 4000) -> dict:
+    text = json.dumps(ctx, default=str)
+    if len(text) <= limit:
+        return ctx
+    return {"_truncated": True, "preview": text[:limit]}
+
+
+def _extract_text(data: dict) -> str:
+    blocks = data.get("content", [])
+    parts = [
+        b.get("text", "")
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == "text"
+    ]
+    return "\n".join(parts).strip()
+
+
+def _parse_decision(text: str) -> BrainDecision:
+    # tolerate code fences / surrounding prose
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("no JSON object in LLM output")
+    obj = json.loads(text[start : end + 1])
+    return BrainDecision(
+        action=str(obj.get("action", "proceed")),
+        reasoning=str(obj.get("reasoning", ""))[:280],
+        params=obj.get("params", {}) if isinstance(obj.get("params"), dict) else {},
+        confidence=float(obj.get("confidence", 0.6))
+        if _is_num(obj.get("confidence"))
+        else 0.6,
+    )
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float))

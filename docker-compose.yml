@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@db:5432/sentinel
+      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET:-change-me-in-prod}
+      SENTINEL_SECRET_ENCRYPTION_KEY: ${SENTINEL_SECRET_ENCRYPTION_KEY:-change-me-too}
+      SENTINEL_ENVIRONMENT: production
+      SENTINEL_ALLOW_PRIVATE_NETWORKS: "false"
+      # Optional: enable real LLM brains for the agent pool
+      SENTINEL_ANTHROPIC_API_KEY: ${SENTINEL_ANTHROPIC_API_KEY:-}
+      SENTINEL_ENABLE_LLM_PLANNER: ${SENTINEL_ENABLE_LLM_PLANNER:-false}
+    # The app creates its schema on startup (init_db); no migration step required.
+    command: >
+      sh -c "gunicorn app.main:app -k uvicorn.workers.UvicornWorker
+             --bind 0.0.0.0:8000 --workers 1 --timeout 120"
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
