@@ -217,6 +217,7 @@ class DeclarativeCheck(BaseCheck):
                                 "param": name,
                                 "payload": payload,
                                 "detector": "error_signature",
+                                "signatures": list(sigs),
                             },
                         )
                     ]

@@ -8,7 +8,7 @@ report never implies unscanned assets are secure.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -32,7 +32,7 @@ def build_report_payload(
 
     return {
         "report_version": "1.0",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "assessment": assessment,
         "target": target,
         "authorization": {

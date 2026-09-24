@@ -71,7 +71,7 @@ class GuardedHttpClient:
         self.error_count = 0
         self.consecutive_errors = 0
 
-    async def __aenter__(self) -> "GuardedHttpClient":
+    async def __aenter__(self) -> GuardedHttpClient:
         # follow_redirects=False: we re-authorize each hop ourselves.
         self._client = httpx.AsyncClient(
             follow_redirects=False,

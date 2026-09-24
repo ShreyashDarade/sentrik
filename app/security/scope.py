@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.config import get_settings
 from app.core.enums import Environment, TestIntensity, VerificationStatus
@@ -75,7 +75,7 @@ class ScopeGuard:
     # Precondition: the record itself must be usable
     # ------------------------------------------------------------------ #
     def check_record_active(self, *, now: datetime | None = None) -> ScopeDecision:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         if self.record.status != VerificationStatus.VERIFIED.value:
             return ScopeDecision(
                 False,
@@ -270,7 +270,7 @@ class ScopeGuard:
 
 
 def _aware(dt: datetime) -> datetime:
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def _coerce_env(value: str) -> Environment:

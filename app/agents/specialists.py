@@ -13,7 +13,7 @@ realistic assessment naturally runs 100+ agent instances, each brain-driven.
 
 from __future__ import annotations
 
-from app.agents.base import Agent, AgentContext, AgentResult
+from app.agents.base import Agent, AgentContext
 from app.agents.brain import Brain, BrainDecision, BrainTask
 from app.checks.base import BaseCheck, RawFinding
 from app.checks.context import CheckContext
@@ -33,6 +33,7 @@ class SpecialistCheckAgent(Agent):
         super().__init__(brain=brain, **kw)
         self.check = check
         self.check_ctx = check_ctx
+        self._probes = 0
 
     def _instruction(self, ctx: AgentContext) -> str:
         return (
@@ -67,19 +68,46 @@ class SpecialistCheckAgent(Agent):
             self.check_ctx.endpoint.parameters.sort(
                 key=lambda p: rank.get(p.get("name", ""), 999)
             )
+        # On a revise pass (F-08), deepen the probe: try more injection payloads.
+        if self._probes > 0:
+            self.check_ctx.max_payloads = min(self.check_ctx.max_payloads * 2, 48)
+        self._probes += 1
         if not await self.check.applies_to(self.check_ctx):
             return []
         return await self.check.run(self.check_ctx)
+
+    def _can_revise(self, ctx: AgentContext, step: int) -> bool:
+        # Bounded observe→revise (F-08): one deeper pass when the first found nothing and
+        # the endpoint actually has parameters worth re-probing.
+        return step == 0 and bool(self.check_ctx.injectable_params())
 
     async def _verify(
         self, ctx: AgentContext, findings: list[RawFinding]
     ) -> list[RawFinding]:
         # Specialist self-check: drop findings with no evidence (defensive).
-        return [
+        verified = [
             f
             for f in findings
             if f.evidence or f.check_class in ("security_headers", "info_disclosure")
         ]
+        # Publish finding signals on the A2A bus for coordinator-side aggregation (F-05).
+        bus = (ctx.extra or {}).get("bus")
+        if bus is not None:
+            from app.agents.a2a import AgentMessage
+
+            for f in verified:
+                await bus.publish(
+                    AgentMessage(
+                        topic="findings",
+                        sender=self.id,
+                        payload={
+                            "check_class": f.check_class,
+                            "severity": getattr(f.severity, "value", str(f.severity)),
+                            "title": f.title,
+                        },
+                    )
+                )
+        return verified
 
 
 class DiscoveryAgent(Agent):

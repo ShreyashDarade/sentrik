@@ -19,7 +19,7 @@ memory, and are never written to evidence.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -53,7 +53,7 @@ class SessionState:
         )
 
     def _is_expired(self) -> bool:
-        return bool(self.expires_at and datetime.now(timezone.utc) >= self.expires_at)
+        return bool(self.expires_at and datetime.now(UTC) >= self.expires_at)
 
 
 def _json_path(data: dict, path: str):
@@ -66,6 +66,21 @@ def _json_path(data: dict, path: str):
     return cur
 
 
+def secret_is_stale(account: TestAccount) -> bool:
+    """True if the account's stored secret has a TTL and is past it (F-10)."""
+    ttl = getattr(account, "secret_ttl_days", 0) or 0
+    if ttl <= 0:
+        return False
+    rotated = getattr(account, "secret_rotated_at", None)
+    if rotated is None:
+        # a TTL is set but the secret was never rotated/stamped → treat as stale
+        return True
+    from datetime import datetime, timedelta
+
+    rotated = rotated if rotated.tzinfo else rotated.replace(tzinfo=UTC)
+    return datetime.now(UTC) > rotated + timedelta(days=ttl)
+
+
 async def establish_session(account: TestAccount) -> SessionState:
     """Resolve a TestAccount into a live session. Never raises on target errors."""
     state = SessionState(
@@ -76,6 +91,14 @@ async def establish_session(account: TestAccount) -> SessionState:
         owns_object_ids=list(account.owns_object_ids or []),
     )
     cfg = account.login_config or {}
+    # Enforce secret TTL/rotation (F-10): a stale secret is refused rather than used.
+    if secret_is_stale(account):
+        state.status = "stale"
+        state.detail = (
+            f"stored secret is past its {account.secret_ttl_days}-day TTL; rotate it "
+            "via POST /v1/targets/{id}/test-accounts/{id}/rotate-secret"
+        )
+        return state
     try:
         secret = decrypt(account.secret_enc) if account.secret_enc else ""
     except ValueError as exc:
@@ -160,7 +183,7 @@ def _apply_success(account, cfg, state, resp, body) -> None:
         state.headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
 
     ttl = int(cfg.get("session_ttl_seconds", 3600))
-    state.expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+    state.expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
     state.status = "active"
     state.detail = "authenticated"
     # allow account config to override owned object ids after login (dynamic ids)

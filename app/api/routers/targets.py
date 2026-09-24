@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -465,7 +466,7 @@ async def rotate_account_secret(
     no expiry) lets operations flag stale credentials. The plaintext secret is never
     returned or logged.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     await _get_target(session, principal, target_id)
     account = await session.get(TestAccount, account_id)
@@ -480,7 +481,7 @@ async def rotate_account_secret(
         raise HTTPException(status_code=422, detail="'secret' is required")
     ttl_days = int(body.get("ttl_days", account.secret_ttl_days or 0))
     account.secret_enc = encrypt(secret)
-    account.secret_rotated_at = datetime.now(timezone.utc)
+    account.secret_rotated_at = datetime.now(UTC)
     account.secret_ttl_days = ttl_days
     await write_audit(
         session,

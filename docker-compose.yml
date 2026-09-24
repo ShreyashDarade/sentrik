@@ -22,8 +22,11 @@ services:
         condition: service_healthy
     environment:
       SENTINEL_DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@db:5432/sentinel
-      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET:-change-me-in-prod}
-      SENTINEL_SECRET_ENCRYPTION_KEY: ${SENTINEL_SECRET_ENCRYPTION_KEY:-change-me-too}
+      # No insecure defaults: compose fails if these are unset (F-02). Generate with:
+      #   export SENTINEL_JWT_SECRET=$(openssl rand -hex 32)
+      #   export SENTINEL_SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)
+      SENTINEL_JWT_SECRET: ${SENTINEL_JWT_SECRET:?set a strong SENTINEL_JWT_SECRET}
+      SENTINEL_SECRET_ENCRYPTION_KEY: ${SENTINEL_SECRET_ENCRYPTION_KEY:?set a strong SENTINEL_SECRET_ENCRYPTION_KEY}
       SENTINEL_ENVIRONMENT: production
       SENTINEL_ALLOW_PRIVATE_NETWORKS: "false"
       # Optional: enable real LLM brains for the agent pool

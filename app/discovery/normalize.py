@@ -75,7 +75,7 @@ def endpoint_fingerprint(method: str, url: str, path_template: str = "") -> str:
     port = parts.port or (443 if parts.scheme == "https" else 80)
     tmpl = path_template or templatize_path(parts.path or "/")
     key = f"{method.upper()} {host}:{port}{tmpl}"
-    return hashlib.sha1(key.encode()).hexdigest()  # noqa: S324 (non-crypto dedup key)
+    return hashlib.sha1(key.encode()).hexdigest()
 
 
 def merge_endpoints(endpoints: list[DiscoveredEndpoint]) -> list[DiscoveredEndpoint]:

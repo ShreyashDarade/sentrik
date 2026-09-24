@@ -89,6 +89,12 @@ class SecurityHeadersCheck(BaseCheck):
                     evidence=[ev],
                     endpoint_url=ctx.endpoint.url,
                     dedup_seed=f"headers:{sorted(missing)}",
+                    reproduction={
+                        "method": "GET",
+                        "url": ctx.endpoint.url,
+                        "detector": "headers_missing",
+                        "headers": missing,
+                    },
                 )
             )
 
@@ -108,6 +114,12 @@ class SecurityHeadersCheck(BaseCheck):
                     evidence=[ev],
                     endpoint_url=ctx.endpoint.url,
                     dedup_seed=f"disclosure:{sorted(disclosed)}",
+                    reproduction={
+                        "method": "GET",
+                        "url": ctx.endpoint.url,
+                        "detector": "headers_disclosure",
+                        "headers": sorted(disclosed),
+                    },
                 )
             )
         return findings

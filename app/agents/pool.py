@@ -59,7 +59,7 @@ class AgentPool:
                 result = await asyncio.wait_for(
                     agent.run(ctx), timeout=self.per_agent_timeout
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self.stats.errored += 1
                 return AgentResult(agent_id=agent.id, role=agent.role, error="timeout")
             except Exception as exc:  # noqa: BLE001

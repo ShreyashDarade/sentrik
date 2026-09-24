@@ -48,7 +48,6 @@ def _paginate(text: str) -> list[list[str]]:
 def text_to_pdf(text: str) -> bytes:
     """Render plain text (or Markdown source) into a valid multi-page PDF byte string."""
     pages = _paginate(text)
-    objects: list[bytes] = []
 
     # Object numbering: 1=Catalog, 2=Pages, 3=Font, then per page: content + page objs.
     font_obj = 3

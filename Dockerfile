@@ -14,7 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 COPY pyproject.toml README.md ./
 COPY app ./app
 
-RUN pip install --upgrade pip && pip install . "psycopg[binary]>=3.1" gunicorn dnspython
+# Install the full stack (agents/observability/postgres extras) so the container has
+# LangChain/LangGraph/MCP/OpenTelemetry — not just core deps (F-03).
+RUN pip install --upgrade pip && pip install ".[agents,observability,postgres]" gunicorn
 
 # Non-root runtime user
 RUN useradd -m -u 10001 sentrik && chown -R sentrik:sentrik /app

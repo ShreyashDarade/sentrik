@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
         try:
             await seed_builtin_skills(session)
             await session.commit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.warning("skill seeding skipped", exc_info=True)
     try:
         from app.orchestration.engine import resume_incomplete_assessments
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
         resumed = await resume_incomplete_assessments()
         if resumed:
             log.info("resumed %d interrupted assessment(s): %s", len(resumed), resumed)
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.warning("assessment resume sweep skipped", exc_info=True)
     log.info("Sentinel %s started (env=%s)", __version__, get_settings().environment)
     yield
@@ -118,7 +118,7 @@ def create_app() -> FastAPI:
         return _error_envelope(422, "validation_error", exc.errors(), request)
 
     @app.exception_handler(Exception)
-    async def _unhandled(request: Request, exc: Exception):  # noqa: BLE001
+    async def _unhandled(request: Request, exc: Exception):
         log.exception("unhandled error")
         return _error_envelope(500, "internal_error", str(exc), request)
 
@@ -146,7 +146,7 @@ def create_app() -> FastAPI:
 
     @app.get("/", tags=["meta"])
     async def root():
-        return {"service": "sentinel", "version": __version__, "docs": "/docs"}
+        return {"service": "sentrik", "version": __version__, "docs": "/docs"}
 
     return app
 

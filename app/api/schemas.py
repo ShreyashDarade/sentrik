@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -72,7 +72,7 @@ class OwnershipStart(BaseModel):
     method: str = (
         "lab_bundled"  # dns_txt | http_file | manual_attestation | lab_bundled
     )
-    attestation: Optional[str] = None
+    attestation: str | None = None
 
 
 class OwnershipOut(BaseModel):
@@ -97,8 +97,8 @@ class AuthorizationCreate(BaseModel):
     max_requests: int = 2000
     rate_limit_per_sec: float = 10.0
     max_duration_seconds: int = 900
-    window_start: Optional[datetime] = None
-    window_end: Optional[datetime] = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
     allow_state_changing: bool = False
     authorized_by: str = ""
     notes: str = ""
@@ -173,13 +173,13 @@ class AssessmentOut(BaseModel):
     state: str
     is_retest: bool
     incremental: bool = False
-    previous_assessment_id: Optional[str] = None
+    previous_assessment_id: str | None = None
     requests_made: int
     error: str = ""
     summary: dict = Field(default_factory=dict)
-    created_at: Optional[datetime] = None
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class AssessmentProgress(BaseModel):
@@ -226,7 +226,7 @@ class FindingOut(BaseModel):
     risk_score: float
     risk_breakdown: dict
     reproduction: dict
-    endpoint_id: Optional[str] = None
+    endpoint_id: str | None = None
 
 
 class EndpointOut(BaseModel):
@@ -246,8 +246,8 @@ class EndpointOut(BaseModel):
 # --------------------------------------------------------------------------- #
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None
-    assessment_id: Optional[str] = None
+    session_id: str | None = None
+    assessment_id: str | None = None
 
 
 class ChatReply(BaseModel):

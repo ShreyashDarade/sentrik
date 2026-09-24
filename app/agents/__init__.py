@@ -12,11 +12,11 @@ from app.agents.base import Agent, AgentContext, AgentResult
 from app.agents.brain import Brain, BrainDecision, BrainTask, get_brain
 
 __all__ = [
+    "Agent",
+    "AgentContext",
+    "AgentResult",
     "Brain",
     "BrainDecision",
     "BrainTask",
     "get_brain",
-    "Agent",
-    "AgentContext",
-    "AgentResult",
 ]

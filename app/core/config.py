@@ -68,15 +68,38 @@ class Settings(BaseSettings):
     local_llm_model: str = ""
     local_llm_api_key: str = "local"
 
+    @staticmethod
+    def _is_weak_secret(value: str) -> bool:
+        """A secret is weak if it is empty, too short, or looks like a placeholder."""
+        if not value or len(value) < 16:
+            return True
+        low = value.lower()
+        placeholders = (
+            "change",
+            "insecure",
+            "please",
+            "example",
+            "default",
+            "changeme",
+            "todo",
+            "dev-",
+            "your-",
+            "placeholder",
+        )
+        return any(tok in low for tok in placeholders)
+
     def production_secret_problems(self) -> list[str]:
-        """Return a list of insecure-default problems that must fail-fast in production."""
+        """Return insecure-config problems that must fail-fast in production (F-02)."""
         problems: list[str] = []
         if self.environment == "production":
-            if self.jwt_secret in ("", "dev-insecure-change-me"):
-                problems.append("SENTINEL_JWT_SECRET is unset/default")
-            if not self.secret_encryption_key:
+            if self._is_weak_secret(self.jwt_secret):
                 problems.append(
-                    "SENTINEL_SECRET_ENCRYPTION_KEY is unset (secrets would not survive restart)"
+                    "SENTINEL_JWT_SECRET is unset/placeholder/too-short (need >=16 random chars)"
+                )
+            if self._is_weak_secret(self.secret_encryption_key):
+                problems.append(
+                    "SENTINEL_SECRET_ENCRYPTION_KEY is unset/placeholder/too-short "
+                    "(need >=16 random chars; secrets would not survive restart)"
                 )
             if self.allow_private_networks:
                 problems.append(

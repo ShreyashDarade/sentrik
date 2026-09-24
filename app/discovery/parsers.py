@@ -21,7 +21,7 @@ class ParseResult:
     endpoints: list[DiscoveredEndpoint] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def extend(self, other: "ParseResult") -> None:
+    def extend(self, other: ParseResult) -> None:
         self.endpoints.extend(other.endpoints)
         self.warnings.extend(other.warnings)
 

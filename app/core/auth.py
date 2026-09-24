@@ -15,7 +15,7 @@ from __future__ import annotations
 import hmac
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import Depends, Header, HTTPException, status
 from jose import JWTError, jwt
@@ -75,7 +75,7 @@ class Principal:
 # --------------------------------------------------------------------------- #
 def create_access_token(*, org_id: str, user_id: str, role: str) -> str:
     s = get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     payload = {
         "sub": user_id,
         "org": org_id,
@@ -127,7 +127,7 @@ async def _principal_from_api_key(raw: str, session: AsyncSession) -> Principal:
     row = (
         await session.execute(
             select(ApiKey).where(ApiKey.prefix == prefix, ApiKey.revoked == False)
-        )  # noqa: E712
+        )
     ).scalar_one_or_none()
     # constant-time-ish: always run a verify to reduce timing oracle even when prefix misses
     if row is None:

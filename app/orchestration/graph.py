@@ -58,7 +58,7 @@ def build_assessment_graph(engine):
                         "error": result,
                         "last_phase": name,
                     }
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.exception("graph node %s failed", name)
                 await engine.mark_failed(f"{type(exc).__name__}: {exc}")
                 return {

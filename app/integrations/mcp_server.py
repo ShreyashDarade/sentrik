@@ -199,3 +199,30 @@ def _register_check_tool(
         name=f"check.{check_name}",
         description=f"{check_class} check ({intensity}, {cwe}); bound to authorized scope.",
     )(_tool)
+
+
+def serve_stdio() -> None:
+    """Run the Sentrik MCP server over stdio (blocking).
+
+    Register it with an MCP client (Claude Code / Cursor) — example config:
+
+        {
+          "mcpServers": {
+            "sentrik": {
+              "command": "python",
+              "args": ["-m", "app.integrations.mcp_server"],
+              "env": {"SENTINEL_DATABASE_URL": "sqlite+aiosqlite:///./sentinel.db"}
+            }
+          }
+        }
+
+    Every tool call remains bound to a stored, verified AuthorizationRecord and is routed
+    through the deterministic ScopeGuard + GuardedHttpClient — the MCP client cannot widen
+    scope. Approval/permission gating is delegated to the client's own tool-approval UX.
+    """
+    server = build_server()
+    server.run()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    serve_stdio()

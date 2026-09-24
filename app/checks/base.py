@@ -45,7 +45,7 @@ class RawFinding:
 
     def dedup_key(self, endpoint_fp: str) -> str:
         seed = self.dedup_seed or f"{self.check_class}:{self.endpoint_url}:{self.title}"
-        return hashlib.sha1(f"{endpoint_fp}:{seed}".encode()).hexdigest()  # noqa: S324
+        return hashlib.sha1(f"{endpoint_fp}:{seed}".encode()).hexdigest()
 
 
 class CheckError(RuntimeError):
@@ -60,12 +60,10 @@ class BaseCheck:
     # Whether this check mutates state (informs policy gating).
     state_changing: bool = False
 
-    async def applies_to(
-        self, ctx: "CheckContext"
-    ) -> bool:  # pragma: no cover - default
+    async def applies_to(self, ctx: CheckContext) -> bool:  # pragma: no cover - default
         return True
 
-    async def run(self, ctx: "CheckContext") -> list[RawFinding]:
+    async def run(self, ctx: CheckContext) -> list[RawFinding]:
         raise NotImplementedError
 
 
@@ -93,4 +91,4 @@ class _Registry:
 registry = _Registry()
 
 # Re-export CheckContext from context module to avoid import cycle at type level.
-from app.checks.context import CheckContext  # noqa: E402
+from app.checks.context import CheckContext

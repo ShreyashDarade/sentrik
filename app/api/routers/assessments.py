@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -35,7 +36,6 @@ from app.models import (
     ProjectMemory,
     RegressionTest,
     Target,
-    ValidationResult,
 )
 from app.orchestration import engine as orchestrator
 from app.security.http_client import GuardedHttpClient
@@ -339,8 +339,8 @@ async def ingest_traffic(
     """
     from urllib.parse import urlsplit
 
-    from app.discovery.normalize import DiscoveredEndpoint, endpoint_fingerprint
     from app.core.enums import Provenance
+    from app.discovery.normalize import DiscoveredEndpoint, endpoint_fingerprint
     from app.security.scope import ScopeGuard
 
     a = await _get_assessment(session, principal, assessment_id)
@@ -428,6 +428,42 @@ async def ingest_traffic(
         "skipped_out_of_scope": skipped_scope,
         "skipped_duplicate": skipped_dup,
     }
+
+
+@router.post("/assessments/cancel-all")
+async def cancel_all(
+    principal: Principal = Depends(require_role(Role.ADMIN)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Emergency stop-all: request cancellation of every running assessment in the org
+    (F-04). Honored at the next phase/step boundary of each run."""
+    terminal = {
+        AssessmentState.COMPLETED.value,
+        AssessmentState.CANCELLED.value,
+        AssessmentState.FAILED.value,
+    }
+    rows = (
+        (
+            await session.execute(
+                select(Assessment).where(
+                    Assessment.org_id == principal.org_id,
+                    Assessment.state.notin_(list(terminal)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for a in rows:
+        a.cancel_requested = True
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        event="assessment.cancel_all",
+        data={"count": len(rows)},
+    )
+    await session.commit()
+    return {"cancel_requested": len(rows), "assessment_ids": [a.id for a in rows]}
 
 
 @router.post("/assessments/{assessment_id}/cancel", response_model=AssessmentOut)
@@ -826,14 +862,38 @@ async def attack_path(
         for f in findings
         if f.check_class in ("xss", "open_redirect", "info_disclosure")
     ]
+    # Evidence-derived chaining (F-13): only chain an enabler to a consequent when they
+    # share the same endpoint or the same path prefix — not all-pairs. This ties the edge
+    # to observed surface rather than every possible combination.
+    ep_by_id = {e.id: e for e in endpoints}
+
+    def _prefix(fid_endpoint_id: str | None) -> str:
+        e = ep_by_id.get(fid_endpoint_id)
+        if not e:
+            return ""
+        segs = [s for s in (e.path_template or "").split("/") if s]
+        return "/".join(segs[:2])  # first two path segments
+
     for a1 in enablers:
         for a2 in consequents:
-            if a1.id != a2.id:
+            if a1.id == a2.id:
+                continue
+            same_endpoint = a1.endpoint_id and a1.endpoint_id == a2.endpoint_id
+            same_prefix = (
+                a1.endpoint_id
+                and a2.endpoint_id
+                and _prefix(a1.endpoint_id)
+                and _prefix(a1.endpoint_id) == _prefix(a2.endpoint_id)
+            )
+            if same_endpoint or same_prefix:
                 edges.append(
                     {
                         "from": f"finding:{a1.id}",
                         "to": f"finding:{a2.id}",
                         "rel": "may_enable",
+                        "basis": "same_endpoint"
+                        if same_endpoint
+                        else "same_path_prefix",
                         "confidence": "heuristic",
                     }
                 )
@@ -841,7 +901,8 @@ async def attack_path(
         "assessment_id": assessment_id,
         "nodes": nodes,
         "edges": edges,
-        "note": "Scoped to this assessment's app/API surface; heuristic chain edges are labeled.",
+        "note": "Scoped to this assessment; chain edges are evidence-derived "
+        "(same endpoint or path prefix) and labeled heuristic.",
     }
 
 
@@ -933,9 +994,9 @@ async def run_regression_tests(
         for t in tests:
             res = await run_regression(client, t.definition)
             t.last_status = res.status
-            from datetime import datetime, timezone
+            from datetime import datetime
 
-            t.last_run_at = datetime.now(timezone.utc)
+            t.last_run_at = datetime.now(UTC)
             results.append(
                 {
                     "id": t.id,

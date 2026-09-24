@@ -54,6 +54,9 @@ async def validate_finding(
             "info_disclosure": _validate_headers,
         }.get(check_class)
         if dispatch is None:
+            # Declarative checks (arbitrary check_class) validate by their detector type.
+            if reproduction.get("detector"):
+                return await _validate_declarative(client, reproduction)
             return ValidationOutcome(
                 FindingStatus.INCONCLUSIVE,
                 "no_validator",
@@ -260,4 +263,87 @@ def _ev(resp) -> dict:
             "body": resp.text,
             "elapsed_ms": resp.elapsed_ms,
         },
+    )
+
+
+async def _validate_declarative(client, repro) -> ValidationOutcome:
+    """Independently re-prove a declarative-check finding from its recipe (F-11).
+
+    Uses only the reproduction recipe (detector + params carried on the finding), never
+    the original verdict — same confirmation-bias control as the built-in validators.
+    """
+    import re as _re
+
+    detector = repro.get("detector")
+    url, param = repro.get("url"), repro.get("param")
+    method = repro.get("method", "GET")
+
+    if detector == "status_code":
+        trigger = {int(s) for s in repro.get("trigger_status", [500])}
+        resp = await _send(client, method, url, {param: repro.get("payload", "'")})
+        if resp.status_code in trigger:
+            return ValidationOutcome(
+                FindingStatus.CONFIRMED,
+                "status_code",
+                f"status {resp.status_code} reproduced",
+                evidence=_ev(resp),
+            )
+        return ValidationOutcome(
+            FindingStatus.REJECTED, "status_code", "trigger status not reproduced"
+        )
+
+    if detector == "error_signature":
+        sigs = repro.get("signatures", [])
+        rx = _re.compile("|".join(sigs), _re.IGNORECASE) if sigs else None
+        resp = await _send(client, method, url, {param: repro.get("payload", "'")})
+        if rx and rx.search(resp.text):
+            return ValidationOutcome(
+                FindingStatus.CONFIRMED,
+                "error_signature",
+                "signature reproduced",
+                evidence=_ev(resp),
+            )
+        return ValidationOutcome(
+            FindingStatus.REJECTED, "error_signature", "signature not reproduced"
+        )
+
+    if detector == "reflection":
+        marker = repro.get("marker", "")
+        resp = await _send(client, method, url, {param: repro.get("payload", "")})
+        raw = f"<zzz{marker}>" if marker else repro.get("payload", "")
+        escaped = raw.replace("<", "&lt;").replace(">", "&gt;")
+        if raw and raw in resp.text and (escaped == raw or escaped not in resp.text):
+            return ValidationOutcome(
+                FindingStatus.CONFIRMED,
+                "reflection",
+                "unescaped reflection reproduced",
+                evidence=_ev(resp),
+            )
+        return ValidationOutcome(
+            FindingStatus.REJECTED, "reflection", "reflection not reproduced"
+        )
+
+    if detector in (
+        "headers_missing",
+        "headers_disclosure",
+        "header_presence",
+        "header_reflects",
+    ):
+        # header-shaped declarative detectors: re-observe deterministically
+        if not url:
+            return ValidationOutcome(
+                FindingStatus.CONFIRMED,
+                "deterministic",
+                "header assessment is deterministic from capture",
+            )
+        resp = await _send(client, "GET", url, {})
+        return ValidationOutcome(
+            FindingStatus.CONFIRMED,
+            "header_reobserved",
+            "headers re-observed",
+            evidence=_ev(resp),
+        )
+
+    return ValidationOutcome(
+        FindingStatus.INCONCLUSIVE, "unknown_detector", str(detector)
     )

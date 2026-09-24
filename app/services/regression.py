@@ -12,7 +12,6 @@ import re
 from dataclasses import dataclass
 
 from app.checks.sqli import DB_ERROR_SIGNATURES
-from app.core.enums import FindingStatus
 from app.security.http_client import GuardedHttpClient, TargetUnreachable
 from app.security.scope import ScopeViolation
 

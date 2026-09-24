@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.base import Agent, AgentContext
 from app.agents.brain import BrainTask, get_brain
 from app.agents.pool import AgentPool
+from app.agents.registry import load_declarative_checks
 from app.agents.router import router as capability_router
 from app.agents.specialists import (
     CoordinatorAgent,
@@ -37,7 +38,6 @@ from app.agents.specialists import (
     SpecialistCheckAgent,
     ValidationAgent,
 )
-from app.agents.registry import load_declarative_checks
 from app.checks.base import RawFinding
 from app.checks.base import registry as check_registry
 from app.checks.context import CheckContext, EndpointView
@@ -130,28 +130,29 @@ async def _supervise(assessment_id: str) -> None:
         async with _sem():
             engine = AssessmentEngine(assessment_id)
             try:
+                settings = get_settings()
                 with span(
                     "assessment.run", assessment_id=assessment_id, org_id=org_id or ""
                 ):
-                    pass  # span marks scheduling; per-phase spans live in the engine
-                settings = get_settings()
-                if settings.use_langgraph:
-                    from app.orchestration.graph import (
-                        LANGGRAPH_AVAILABLE,
-                        run_via_langgraph,
-                    )
-
-                    if LANGGRAPH_AVAILABLE:
-                        log.info("running assessment %s via LangGraph", assessment_id)
-                        await run_via_langgraph(assessment_id)
-                    else:
-                        log.warning(
-                            "SENTINEL_USE_LANGGRAPH set but langgraph unavailable; using inline engine"
+                    if settings.use_langgraph:
+                        from app.orchestration.graph import (
+                            LANGGRAPH_AVAILABLE,
+                            run_via_langgraph,
                         )
+
+                        if LANGGRAPH_AVAILABLE:
+                            log.info(
+                                "running assessment %s via LangGraph", assessment_id
+                            )
+                            await run_via_langgraph(assessment_id)
+                        else:
+                            log.warning(
+                                "SENTINEL_USE_LANGGRAPH set but langgraph unavailable; using inline engine"
+                            )
+                            await engine.run()
+                    else:
                         await engine.run()
-                else:
-                    await engine.run()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.exception("assessment %s crashed", assessment_id)
                 await engine.mark_failed(f"engine crash: {type(exc).__name__}: {exc}")
             finally:
@@ -169,12 +170,14 @@ async def wait_for(assessment_id: str, timeout: float = 120.0) -> None:
 
 
 async def resume_incomplete_assessments() -> list[str]:
-    """Recover assessments interrupted mid-run (e.g. a crashed/restarted worker).
-
-    Reads each non-terminal assessment's durable `Checkpoint` (the resume cursor), clears
-    its partial per-run artifacts to keep the restart idempotent, and re-enqueues it. This
-    is the read-back consumer of the checkpoints the engine writes each phase. Returns the
-    list of resumed assessment ids. Safe to call on startup.
+    """Recover assessments interrupted mid-run via an **idempotent restart** (not a
+    phase-resume): for each non-terminal, not-currently-running assessment, clear its
+    partial per-run artifacts, reset to CREATED, and re-enqueue a fresh run. The durable
+    `Checkpoint` is read to record which phase was interrupted (audit `from_checkpoint`),
+    but the run restarts from the beginning — this is deterministic and safe. True
+    resume-from-phase (skipping completed phases, preserving findings) is a future
+    enhancement and would pair with a durable LangGraph checkpointer. Returns the list of
+    restarted assessment ids. Safe to call on startup.
     """
     sm = get_sessionmaker()
     resumed: list[str] = []
@@ -751,11 +754,18 @@ class AssessmentEngine:
             agents.append(agent)
             step_by_agent[agent.id] = step
 
+        # A2A bus (used in the live path): specialists publish finding signals; the
+        # coordinator consumes them below to inform replanning.
+        from app.agents.a2a import MessageBus
+
+        bus = MessageBus()
+        findings_queue = await bus.subscribe("findings")
         ctx = AgentContext(
             assessment_id=self.assessment_id,
             budget_remaining_getter=lambda: max(
                 0, guard.record.max_requests - guard.requests_made
             ),
+            extra={"bus": bus},
         )
 
         # Stream results so we can honor cancellation/deadline/health mid-execution.
@@ -808,6 +818,29 @@ class AssessmentEngine:
                         "reason": stop_reason,
                         "health_errors": client.consecutive_errors,
                     },
+                )
+                await session.commit()
+
+        # Consume the A2A bus: coordinator-side aggregation of finding signals (F-05).
+        signals = []
+        while not findings_queue.empty():
+            try:
+                signals.append(findings_queue.get_nowait())
+            except Exception:  # noqa: BLE001
+                break
+        if signals:
+            sev_counts: dict[str, int] = {}
+            for m in signals:
+                sev = str(m.payload.get("severity", "unknown"))
+                sev_counts[sev] = sev_counts.get(sev, 0) + 1
+            async with self._sm() as session:
+                await write_audit(
+                    session,
+                    org_id=org_id,
+                    assessment_id=self.assessment_id,
+                    actor="coordinator",
+                    event="a2a.finding_signals",
+                    data={"messages": len(signals), "by_severity": sev_counts},
                 )
                 await session.commit()
 
@@ -929,6 +962,8 @@ class AssessmentEngine:
             async with self._sm() as session:
                 new_steps: list[PlanStep] = []
                 for eid, cclass, cname in batch:
+                    resolved = _resolve_check(cname, cclass, declaratives)
+                    step_intensity = resolved.intensity.value if resolved else "passive"
                     s = PlanStep(
                         org_id=org_id,
                         assessment_id=self.assessment_id,
@@ -937,7 +972,7 @@ class AssessmentEngine:
                         check_name=cname,
                         rationale="replan: coverage gap",
                         priority=1,
-                        intensity="passive",
+                        intensity=step_intensity,
                         status="approved",
                     )
                     session.add(s)
@@ -1215,7 +1250,65 @@ class AssessmentEngine:
     # ------------------------------------------------------------------ #
     # Phase: score — per-finding + assessment risk, plus coverage
     # ------------------------------------------------------------------ #
+    async def _apply_known_false_positives(self) -> int:
+        """Read project memory (AG-MEM) and auto-reject findings a prior assessment marked
+        as false positives for this target (matched by dedup_key). Returns the count."""
+        from app.models import ProjectMemory
+
+        async with self._sm() as session:
+            assessment = await session.get(Assessment, self.assessment_id)
+            fp_rows = (
+                (
+                    await session.execute(
+                        select(ProjectMemory).where(
+                            ProjectMemory.org_id == assessment.org_id,
+                            ProjectMemory.target_id == assessment.target_id,
+                            ProjectMemory.kind == "false_positive",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            known_keys = {
+                r.key[len("known_fp:") :]
+                for r in fp_rows
+                if r.key.startswith("known_fp:")
+            }
+            if not known_keys:
+                return 0
+            findings = (
+                (
+                    await session.execute(
+                        select(Finding).where(
+                            Finding.assessment_id == self.assessment_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            suppressed = 0
+            for f in findings:
+                if (
+                    f.dedup_key in known_keys
+                    and f.status != FindingStatus.REJECTED.value
+                ):
+                    f.status = FindingStatus.REJECTED.value
+                    suppressed += 1
+            if suppressed:
+                await write_audit(
+                    session,
+                    org_id=assessment.org_id,
+                    assessment_id=self.assessment_id,
+                    event="findings.known_fp_suppressed",
+                    data={"count": suppressed},
+                )
+            await session.commit()
+            return suppressed
+
     async def _phase_score(self) -> None:
+        await self._apply_known_false_positives()
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
             record = await session.get(AuthorizationRecord, assessment.authorization_id)
@@ -1389,9 +1482,9 @@ class AssessmentEngine:
                 return
             a.state = state.value
             if started and a.started_at is None:
-                a.started_at = datetime.now(timezone.utc)
+                a.started_at = datetime.now(UTC)
             if finished:
-                a.finished_at = datetime.now(timezone.utc)
+                a.finished_at = datetime.now(UTC)
             await write_audit(
                 session,
                 org_id=a.org_id,
@@ -1451,7 +1544,7 @@ class AssessmentEngine:
                 return
             a.state = AssessmentState.FAILED.value
             a.error = error
-            a.finished_at = datetime.now(timezone.utc)
+            a.finished_at = datetime.now(UTC)
             await write_audit(
                 session,
                 org_id=a.org_id,

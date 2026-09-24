@@ -8,7 +8,7 @@ scoring, reporting, and regression retesting.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
@@ -30,7 +30,7 @@ def _uuid() -> str:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class TimestampMixin:
@@ -50,7 +50,7 @@ class Organization(Base, TimestampMixin):
     slug: Mapped[str] = mapped_column(String(255), unique=True)
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
 
-    users: Mapped[list["User"]] = relationship(
+    users: Mapped[list[User]] = relationship(
         back_populates="org", cascade="all, delete-orphan"
     )
 
