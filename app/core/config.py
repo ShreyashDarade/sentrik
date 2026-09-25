@@ -125,6 +125,10 @@ class Settings(BaseSettings):
     # Longest an A2A message/send waits for an assessment before returning WORKING.
     a2a_task_wait_seconds: int = 900
 
+    # --- parity seams (slice D) ---
+    # Local directory where the remediation-PR adapter materializes branches (BS-14).
+    remediation_pr_local_dir: str = "./sentrik_remediation"
+
     # --- per-run sandbox (egress isolation) ---
     # "none" (guarded egress only), "process" (asyncio-isolated worker), or "container"
     # (documented deploy profile). Egress is always funnelled through GuardedHttpClient.

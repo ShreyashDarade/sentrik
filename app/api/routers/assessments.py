@@ -872,6 +872,94 @@ async def export_report(
     return {"stored": True, "ref": ref}
 
 
+async def _assessment_findings(session, assessment_id: str) -> list[dict]:
+    rows = (
+        (
+            await session.execute(
+                select(Finding).where(Finding.assessment_id == assessment_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [finding_dict(f) for f in rows]
+
+
+@router.post("/assessments/{assessment_id}/export/siem")
+async def export_siem(
+    assessment_id: str,
+    fmt: str = Query(default="ecs", pattern="^(ecs|cef)$"),
+    sink: str = Query(default="response", pattern="^(response|file)$"),
+    confirmed_only: bool = Query(default=True),
+    principal: Principal = Depends(require_role(Role.OPERATOR)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Export findings as SIEM events (ECS JSON-lines or CEF); Sentinel/Elastic-ingestible (BS-13)."""
+    from app.services import siem
+
+    await _get_assessment(session, principal, assessment_id)
+    findings = await _assessment_findings(session, assessment_id)
+    if confirmed_only:
+        findings = [f for f in findings if f.get("status") == "confirmed"]
+    events = siem.findings_to_events(assessment_id, principal.org_id, findings)
+    payload, content_type = siem.serialize(events, fmt)
+    sink_impl = siem.FileSiemSink() if sink == "file" else siem.ResponseSiemSink()
+    result = await sink_impl.emit(
+        payload, content_type, key=f"siem/{assessment_id}/events.{fmt}"
+    )
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        assessment_id=assessment_id,
+        event="siem.exported",
+        data={"fmt": fmt, "sink": sink, "events": len(events)},
+    )
+    await session.commit()
+    body = {"events": len(events), "format": fmt, "sink": result}
+    if sink == "response":
+        body["payload"] = payload
+    return body
+
+
+@router.post("/assessments/{assessment_id}/remediation-pr")
+async def open_remediation_pr(
+    assessment_id: str,
+    provider: str = Query(default="local", pattern="^(local)$"),
+    principal: Principal = Depends(require_role(Role.OPERATOR)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Open an advisory remediation change set (branch + REMEDIATION.md + patch stub) from
+    confirmed findings, via a provider-agnostic adapter (BS-14). Proposal only — never merged."""
+    from app.core.config import get_settings
+    from app.services import remediation_pr as rpr
+
+    await _get_assessment(session, principal, assessment_id)
+    findings = await _assessment_findings(session, assessment_id)
+    pr = rpr.build_pr_content(assessment_id, findings)
+    root = f"{get_settings().remediation_pr_local_dir}/{principal.org_id}"
+    try:
+        provider_impl = rpr.get_provider(provider, local_root=root)
+        pr = await provider_impl.open_pr(pr)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        assessment_id=assessment_id,
+        event="remediation_pr.opened",
+        data={"provider": pr.provider, "branch": pr.branch, "files": list(pr.files)},
+    )
+    await session.commit()
+    return {
+        "provider": pr.provider,
+        "branch": pr.branch,
+        "title": pr.title,
+        "location": pr.location,
+        "files": list(pr.files),
+        "body": pr.body,
+    }
+
+
 @router.get("/assessments/{assessment_id}/attack-path")
 async def attack_path(
     assessment_id: str,

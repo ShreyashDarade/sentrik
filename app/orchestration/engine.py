@@ -272,13 +272,16 @@ async def resume_incomplete_assessments() -> list[str]:
             ).scalar_one_or_none()
             last_phase = cp.state if cp else "unknown"
             # idempotent restart: clear partial per-run data
+            # Delete FK children before parents (SQLite runs with foreign_keys=ON and the
+            # ORM delete does not cascade): Evidence/ValidationResult reference Finding;
+            # Finding/PlanStep/Coverage reference Endpoint.
             for model in (
-                Finding,
                 Evidence,
                 ValidationResult,
                 Coverage,
-                PlanStep,
                 Job,
+                PlanStep,
+                Finding,
                 Endpoint,
             ):
                 rows = (

@@ -103,6 +103,78 @@ async def _get_target(session, principal, target_id) -> Target:
     return row
 
 
+@router.post("/targets/{target_id}/cloud-assets/evaluate")
+async def evaluate_cloud_assets(
+    target_id: str,
+    provider: str = "fake",
+    authorization_id: str | None = None,
+    principal: Principal = Depends(require_role(Role.OPERATOR)),
+    session: AsyncSession = Depends(get_session),
+):
+    """Enumerate cloud/identity assets via a provider and gate each deny-by-default against
+    the authorization scope (BS-18 / C42). Discovering an asset never grants permission to
+    test it — an asset is authorized only if its host is already in a verified authorization's
+    allow-list. Provider-agnostic seam; the bundled ``fake`` provider needs no cloud account."""
+    from app.security.scope import ScopeGuard
+    from app.services import cloud_assets
+
+    await _get_target(session, principal, target_id)
+    record = None
+    if authorization_id:
+        record = await session.get(AuthorizationRecord, authorization_id)
+        if not record or record.org_id != principal.org_id or record.target_id != target_id:
+            raise HTTPException(status_code=404, detail="authorization not found for target")
+    else:
+        record = (
+            await session.execute(
+                select(AuthorizationRecord)
+                .where(
+                    AuthorizationRecord.target_id == target_id,
+                    AuthorizationRecord.org_id == principal.org_id,
+                    AuthorizationRecord.status == VerificationStatus.VERIFIED.value,
+                )
+                .order_by(AuthorizationRecord.created_at.desc())
+            )
+        ).scalars().first()
+    if record is None:
+        raise HTTPException(
+            status_code=409,
+            detail="a verified authorization record is required to evaluate assets",
+        )
+    try:
+        prov = cloud_assets.get_provider(provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    assets = await prov.enumerate_assets()
+    evaluations = cloud_assets.evaluate_assets(ScopeGuard(record), assets)
+    await write_audit(
+        session,
+        org_id=principal.org_id,
+        event="cloud_assets.evaluated",
+        data={
+            "provider": provider,
+            "assets": len(assets),
+            "authorized": sum(1 for e in evaluations if e.authorized),
+        },
+    )
+    await session.commit()
+    return {
+        "provider": provider,
+        "authorization_id": record.id,
+        "assets": [
+            {
+                "asset_id": e.asset.asset_id,
+                "kind": e.asset.kind,
+                "host": e.asset.host,
+                "authorized": e.authorized,
+                "reason": e.reason,
+                "code": e.code,
+            }
+            for e in evaluations
+        ],
+    }
+
+
 @router.post(
     "/targets/{target_id}/ownership", response_model=OwnershipOut, status_code=201
 )

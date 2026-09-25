@@ -63,6 +63,8 @@ async def validate_finding(
             "security_headers": _validate_headers,
             "info_disclosure": _validate_headers,
             "business_logic": _validate_business_logic,
+            "business_flow": _validate_business_flow,
+            "llm_prompt_injection": _validate_prompt_injection,
         }.get(check_class)
         if dispatch is None:
             # Declarative checks (arbitrary check_class) validate by their detector type.
@@ -304,6 +306,88 @@ async def _validate_business_logic(client, repro) -> ValidationOutcome:
 def _echoes_value(body: str, value: str) -> bool:
     """True if the numeric value appears in the body as a standalone number token."""
     return re.search(rf"(?<![\w.-]){re.escape(value)}(?![\w.])", body or "") is not None
+
+
+async def _validate_business_flow(client, repro) -> ValidationOutcome:
+    """Re-run the multi-step flow and confirm the invariant is still violated (BS-15)."""
+    from app.checks.flow import FLOWS
+
+    flow = next((f for f in FLOWS if f.name == repro.get("flow")), None)
+    origin = repro.get("origin")
+    if flow is None or not origin:
+        return ValidationOutcome(
+            FindingStatus.INCONCLUSIVE, "no_recipe", "flow recipe incomplete"
+        )
+    variables: dict[str, str] = {}
+    observed = None
+    for step in flow.steps:
+        path = step.path.format(**variables) if variables else step.path
+        url = origin + path
+        if step.method.upper() == "GET":
+            resp = await client.get(url, params=step.params or None)
+        else:
+            resp = await client.post(url, json=step.json_body or None)
+        if resp.status_code not in step.expect_status:
+            return ValidationOutcome(
+                FindingStatus.REJECTED,
+                "flow_blocked",
+                f"flow step {step.method} {path} returned {resp.status_code}; invariant holds",
+            )
+        import json as _json
+
+        try:
+            data = _json.loads(resp.text)
+        except (ValueError, TypeError):
+            data = {}
+        for var, key in step.extract.items():
+            if not isinstance(data, dict) or data.get(key) is None:
+                return ValidationOutcome(
+                    FindingStatus.INCONCLUSIVE, "extract_failed", f"could not read {key}"
+                )
+            variables[var] = str(data[key])
+            if var == flow.invariant_var:
+                observed = data[key]
+    try:
+        numeric = float(observed)
+    except (ValueError, TypeError):
+        return ValidationOutcome(FindingStatus.INCONCLUSIVE, "no_value", "no invariant value")
+    if numeric > flow.invariant_max:
+        return ValidationOutcome(
+            FindingStatus.CONFIRMED,
+            "flow_replay",
+            f"{flow.invariant_var}={numeric} exceeds single-use max {flow.invariant_max}",
+        )
+    return ValidationOutcome(
+        FindingStatus.REJECTED,
+        "flow_replay",
+        f"{flow.invariant_var}={numeric} within bounds on re-run",
+    )
+
+
+async def _validate_prompt_injection(client, repro) -> ValidationOutcome:
+    """Re-send the injection probe and confirm a leak marker the baseline lacks (BS-16)."""
+    from app.checks.llm_redteam import _leak_markers
+
+    url, param = repro.get("url"), repro.get("param")
+    if not url or not param:
+        return ValidationOutcome(
+            FindingStatus.INCONCLUSIVE, "no_recipe", "prompt-injection recipe incomplete"
+        )
+    baseline = await client.get(url, params={param: repro.get("baseline", "hello")})
+    injection = await client.get(url, params={param: repro.get("payload", "")})
+    base = set(_leak_markers(baseline.text))
+    leaked = [m for m in _leak_markers(injection.text) if m not in base]
+    if leaked:
+        return ValidationOutcome(
+            FindingStatus.CONFIRMED,
+            "prompt_injection",
+            f"injection leaked markers not present in baseline: {', '.join(leaked)}",
+        )
+    return ValidationOutcome(
+        FindingStatus.REJECTED,
+        "prompt_injection",
+        "no system-prompt/secret leak under injection on re-run",
+    )
 
 
 async def _validate_open_redirect(client, repro) -> ValidationOutcome:

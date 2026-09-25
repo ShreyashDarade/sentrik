@@ -116,3 +116,5 @@ class CheckClass(str, Enum):
     INFO_DISCLOSURE = "info_disclosure"
     OPEN_REDIRECT = "open_redirect"
     BUSINESS_LOGIC = "business_logic"
+    BUSINESS_FLOW = "business_flow"  # multi-step flow invariants (BS-15)
+    LLM_PROMPT_INJECTION = "llm_prompt_injection"  # AI red-team (BS-16)
