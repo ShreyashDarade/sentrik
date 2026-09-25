@@ -233,6 +233,12 @@ class Assessment(Base, TimestampMixin):
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     error: Mapped[str] = mapped_column(Text, default="")
     summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Evidence-based completion (E-03): "executed", "partial:<why>" or
+    # "no_execution:<why>" — set when the run reaches `completed`.
+    completion_reason: Mapped[str] = mapped_column(String(128), default="")
+    # Declarative skill manifests this run planned with (H-02): executed as a frozen
+    # snapshot so a registry change mid-run cannot alter a running assessment.
+    skill_snapshot: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class DiscoveryArtifact(Base, TimestampMixin):
@@ -375,6 +381,8 @@ class Finding(Base, TimestampMixin):
     reproduction: Mapped[dict] = mapped_column(
         JSON, default=dict
     )  # replayable request sequence
+    # Provenance of the check that produced this finding: "name@version#hash8" (H-02).
+    skill_ref: Mapped[str] = mapped_column(String(160), default="")
 
 
 class ValidationResult(Base, TimestampMixin):

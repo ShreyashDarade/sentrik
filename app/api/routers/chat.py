@@ -16,7 +16,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.registry import parse_skill_md, register_manifest, seed_builtin_skills
+from app.agents.registry import (
+    SkillVersionConflict,
+    parse_skill_md,
+    register_manifest,
+    seed_builtin_skills,
+)
 from app.api.schemas import ChatReply, ChatRequest, SkillOut, SkillRegister
 from app.core.auth import Principal, get_principal, require_role
 from app.core.db import get_session
@@ -218,9 +223,13 @@ async def register_skill(
         session
     )  # ensure builtins present alongside the new skill
     manifest = parse_skill_md(body.skill_md)
-    row = await register_manifest(
-        session, manifest, provenance="skill_md", org_id=principal.org_id
-    )
+    try:
+        row = await register_manifest(
+            session, manifest, provenance="skill_md", org_id=principal.org_id
+        )
+    except SkillVersionConflict as exc:
+        # H-02: versions are immutable — a changed manifest needs a new version.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.commit()
     await session.refresh(row)
     out = SkillOut(

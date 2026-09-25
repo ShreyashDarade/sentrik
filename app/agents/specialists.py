@@ -13,10 +13,11 @@ realistic assessment naturally runs 100+ agent instances, each brain-driven.
 
 from __future__ import annotations
 
-from app.agents.base import Agent, AgentContext
+from app.agents.base import Agent, AgentContext, DecisionRecord
 from app.agents.brain import Brain, BrainDecision, BrainTask
 from app.checks.base import BaseCheck, RawFinding
 from app.checks.context import CheckContext
+from app.orchestration.hooks import hooks
 
 
 class SpecialistCheckAgent(Agent):
@@ -74,7 +75,33 @@ class SpecialistCheckAgent(Agent):
         self._probes += 1
         if not await self.check.applies_to(self.check_ctx):
             return []
-        return await self.check.run(self.check_ctx)
+        # CC-02: pre/post tool hooks around the check execution. A pre_tool veto is
+        # recorded in the decision trail (and hence the audit log) and nothing runs.
+        ep = self.check_ctx.endpoint
+        payload = {
+            "assessment_id": ctx.assessment_id,
+            "agent_id": self.id,
+            "tool": self.check.name,
+            "check_class": self.check.check_class.value,
+            "method": ep.method,
+            "path": ep.path_template,
+        }
+        outcome = await hooks.run("pre_tool", payload)
+        if outcome.vetoed:
+            self._decisions.append(
+                DecisionRecord(
+                    agent_id=self.id,
+                    role=self.role,
+                    phase="act",
+                    action="vetoed",
+                    brain_source="hook",
+                    reasoning=outcome.reason[:280],
+                )
+            )
+            return []
+        findings = await self.check.run(self.check_ctx)
+        await hooks.run("post_tool", {**payload, "findings": len(findings)})
+        return findings
 
     def _can_revise(self, ctx: AgentContext, step: int) -> bool:
         # Bounded observe→revise (F-08): one deeper pass when the first found nothing and

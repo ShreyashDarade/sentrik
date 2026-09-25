@@ -8,6 +8,18 @@ falls back to the inline engine (`AssessmentEngine.run`). Both paths share the e
 same phase implementations, so behavior is identical — LangGraph adds durable,
 inspectable workflow orchestration on top.
 
+Durability semantics (B-03 / B-04 / B-07):
+
+* Every node transition is persisted **before** the next node starts
+  (``durability="sync"``), to SQLite (``AsyncSqliteSaver``) or Postgres
+  (``AsyncPostgresSaver``) when the application database is Postgres and the
+  ``langgraph-checkpoint-postgres`` package is installed.
+* ``run_via_langgraph`` inspects the thread first: if the checkpointer holds pending
+  nodes (a crash mid-run, or a run parked on an approval), it **continues** from that
+  node with ``ainvoke(None | Command(resume=...))`` instead of restarting.
+* The ``policy`` node calls ``interrupt()`` when steps are held for per-action approval
+  (CP-03): the run parks with no live task and resumes once an operator decides.
+
 Authorization is still enforced entirely by the deterministic layer beneath the phases;
 the graph only sequences work.
 """
@@ -26,6 +38,7 @@ log = logging.getLogger("sentrik.graph")
 try:  # optional dependency
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, StateGraph
+    from langgraph.types import Command, interrupt
 
     LANGGRAPH_AVAILABLE = True
 except Exception:  # noqa: BLE001  pragma: no cover
@@ -37,6 +50,13 @@ try:  # durable checkpointer (crash-recoverable run state); optional
     SQLITE_CHECKPOINTER_AVAILABLE = True
 except Exception:  # noqa: BLE001  pragma: no cover
     SQLITE_CHECKPOINTER_AVAILABLE = False
+
+try:  # Postgres checkpointer for production deployments; optional
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    POSTGRES_CHECKPOINTER_AVAILABLE = True
+except Exception:  # noqa: BLE001  pragma: no cover
+    POSTGRES_CHECKPOINTER_AVAILABLE = False
 
 
 def _checkpoint_db_path() -> str:
@@ -58,24 +78,40 @@ def _checkpoint_db_path() -> str:
     return "./sentrik_checkpoints.db"
 
 
+def checkpointer_kind() -> str:
+    """Which checkpointer ``checkpointer_cm`` will yield: postgres | sqlite | memory."""
+    url = get_settings().database_url or ""
+    if url.startswith("postgresql") and POSTGRES_CHECKPOINTER_AVAILABLE:
+        return "postgres"
+    if SQLITE_CHECKPOINTER_AVAILABLE:
+        return "sqlite"
+    return "memory"
+
+
 @asynccontextmanager
 async def checkpointer_cm():
-    """Yield a LangGraph checkpointer, durable (AsyncSqliteSaver) when available.
+    """Yield a LangGraph checkpointer, durable whenever a durable backend is available.
 
-    The durable saver persists every node transition to SQLite, so an interrupted run's
-    state survives a process crash and can be resumed on the same ``thread_id``. When the
-    sqlite checkpointer package is not installed we fall back to the in-memory saver, which
-    still gives correct single-process orchestration but no crash recovery.
+    Postgres when the app DB is Postgres and ``langgraph-checkpoint-postgres`` is
+    installed; otherwise ``AsyncSqliteSaver``; otherwise the in-memory saver (correct
+    single-process orchestration, no crash recovery).
     """
-    if SQLITE_CHECKPOINTER_AVAILABLE:
+    kind = checkpointer_kind()
+    if kind == "postgres":  # pragma: no cover - needs a Postgres deployment
+        url = get_settings().database_url.replace("+asyncpg", "").replace("+psycopg", "")
+        async with AsyncPostgresSaver.from_conn_string(url) as saver:
+            await saver.setup()
+            yield saver
+        return
+    if kind == "sqlite":
         path = _checkpoint_db_path()
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         async with AsyncSqliteSaver.from_conn_string(path) as saver:
             yield saver
-    else:  # pragma: no cover - exercised only without the sqlite extra installed
-        yield MemorySaver()
+        return
+    yield MemorySaver()  # pragma: no cover - exercised only without the sqlite extra
 
 
 class AssessmentGraphState(TypedDict, total=False):
@@ -83,6 +119,7 @@ class AssessmentGraphState(TypedDict, total=False):
     status: str  # "running" | "cancelled" | "failed" | "completed"
     error: str
     last_phase: str
+    awaiting_approval: list[str]
 
 
 def build_assessment_graph(engine, checkpointer=None):
@@ -112,7 +149,16 @@ def build_assessment_graph(engine, checkpointer=None):
                         "error": result,
                         "last_phase": name,
                     }
+                if name == "policy" and result:
+                    # B-04: park the run until an operator approves/denies every held
+                    # step. `interrupt` raises here; on resume this node re-runs from the
+                    # top, recomputes the held set and only proceeds once it is empty.
+                    held = list(result)
+                    await engine.mark_parked(held)
+                    interrupt({"awaiting_approval": held})
             except Exception as exc:
+                if type(exc).__name__ == "GraphInterrupt":
+                    raise
                 log.exception("graph node %s failed", name)
                 await engine.mark_failed(f"{type(exc).__name__}: {exc}")
                 return {
@@ -121,7 +167,12 @@ def build_assessment_graph(engine, checkpointer=None):
                     "error": str(exc),
                     "last_phase": name,
                 }
-            return {**state, "status": "running", "last_phase": name}
+            return {
+                **state,
+                "status": "running",
+                "last_phase": name,
+                "awaiting_approval": [],
+            }
 
         return _run
 
@@ -169,27 +220,64 @@ def build_assessment_graph(engine, checkpointer=None):
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
-async def run_via_langgraph(assessment_id: str) -> None:
-    """Run one assessment through the LangGraph workflow."""
+def _config(assessment_id: str) -> dict:
+    return {"configurable": {"thread_id": assessment_id}}
+
+
+async def pending_nodes(assessment_id: str) -> list[str]:
+    """Nodes the durable checkpointer still has to run for this assessment's thread
+    (empty when the thread is unknown or finished). Used by the startup sweep to
+    decide between *continue* and *restart* (B-03)."""
+    if not LANGGRAPH_AVAILABLE:
+        return []
     from app.orchestration.engine import AssessmentEngine
 
+    async with checkpointer_cm() as checkpointer:
+        compiled = build_assessment_graph(
+            AssessmentEngine(assessment_id), checkpointer=checkpointer
+        )
+        snapshot = await compiled.aget_state(_config(assessment_id))
+        return list(snapshot.next or ())
+
+
+async def run_via_langgraph(assessment_id: str) -> dict:
+    """Run one assessment through the LangGraph workflow, continuing a pending thread
+    when one exists. Returns ``{"mode": fresh|resume, "parked": bool, "status": ...}``."""
     from app.agents.budget import reset_current_budget, set_current_budget
+    from app.orchestration.engine import AssessmentEngine
 
     engine = AssessmentEngine(assessment_id)
-    config = {"configurable": {"thread_id": assessment_id}}
+    config = _config(assessment_id)
     # F-09: the durable-workflow path drives phases directly (not via engine.run), so the
     # LLM token/cost ledger must be installed here too.
     budget_token = set_current_budget(engine.llm_budget)
+    outcome: dict = {"mode": "fresh", "parked": False, "status": ""}
     try:
         async with checkpointer_cm() as checkpointer:
             compiled = build_assessment_graph(engine, checkpointer=checkpointer)
-            final = await compiled.ainvoke(
-                {"assessment_id": assessment_id, "status": "running"}, config
-            )
+            snapshot = await compiled.aget_state(config)
+            if snapshot.next:
+                # B-03/B-04: continue from the pending node. A parked approval interrupt
+                # is answered with a Command; a plain crash checkpoint is continued as-is.
+                interrupted = any(getattr(t, "interrupts", ()) for t in snapshot.tasks)
+                payload = Command(resume={"resolved": True}) if interrupted else None
+                outcome["mode"] = "resume"
+                log.info(
+                    "continuing assessment %s from %s", assessment_id, snapshot.next
+                )
+            else:
+                payload = {"assessment_id": assessment_id, "status": "running"}
+            final = await compiled.ainvoke(payload, config, durability="sync")
+        if "__interrupt__" in final:
+            outcome["parked"] = True
+            outcome["status"] = "parked"
+            return outcome
         status = final.get("status")
+        outcome["status"] = status or ""
         if status == "cancelled":
             await engine._finish_cancelled()
         # failed/completed already persisted by the nodes
+        return outcome
     finally:
         reset_current_budget(budget_token)
         await engine._persist_llm_budget()

@@ -176,6 +176,8 @@ class AssessmentOut(BaseModel):
     previous_assessment_id: str | None = None
     requests_made: int
     error: str = ""
+    # E-03: "executed" | "partial:<why>" | "no_execution:<why>" once completed.
+    completion_reason: str = ""
     summary: dict = Field(default_factory=dict)
     created_at: datetime | None = None
     started_at: datetime | None = None
@@ -246,6 +248,7 @@ class FindingOut(BaseModel):
     risk_breakdown: dict
     reproduction: dict
     endpoint_id: str | None = None
+    skill_ref: str = ""  # H-02 provenance: name@version#hash8
 
 
 class EndpointOut(BaseModel):

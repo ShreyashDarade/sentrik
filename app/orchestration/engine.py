@@ -33,7 +33,11 @@ from app.agents.budget import (
     set_current_budget,
 )
 from app.agents.pool import AgentPool
-from app.agents.registry import load_declarative_checks
+from app.agents.registry import (
+    checks_from_snapshot,
+    load_declarative_checks,
+    snapshot_specs,
+)
 from app.agents.router import router as capability_router
 from app.agents.specialists import (
     CoordinatorAgent,
@@ -62,6 +66,7 @@ from app.discovery.normalize import (
     merge_endpoints,
 )
 from app.discovery.parsers import parse_artifact
+from app.orchestration.hooks import hooks
 from app.models import (
     Assessment,
     AuthorizationRecord,
@@ -119,11 +124,20 @@ async def _org_id_of(assessment_id: str) -> str | None:
 
 
 def start_assessment(assessment_id: str) -> None:
-    """Fire-and-forget launch. Idempotent: ignores an already-running assessment."""
+    """Fire-and-forget launch. Idempotent: ignores an already-running assessment.
+
+    In LangGraph mode this also *resumes* a parked or interrupted thread (B-03/B-04):
+    ``run_via_langgraph`` inspects the checkpointer and continues from the pending node.
+    """
     if assessment_id in _running and not _running[assessment_id].done():
         return
     task = asyncio.create_task(_supervise(assessment_id))
     _running[assessment_id] = task
+
+
+def is_running(assessment_id: str) -> bool:
+    task = _running.get(assessment_id)
+    return bool(task and not task.done())
 
 
 def start_approved_steps(assessment_id: str, step_ids: list[str]) -> None:
@@ -223,6 +237,32 @@ async def resume_incomplete_assessments() -> list[str]:
         )
         targets = [(a.id, a.org_id) for a in stuck if a.id not in _running]
 
+    # B-03: LangGraph mode — a thread with pending nodes (crash mid-run, or parked on
+    # an approval interrupt) is *continued* from its checkpoint, data intact.
+    settings = get_settings()
+    if settings.use_langgraph:
+        from app.orchestration.graph import LANGGRAPH_AVAILABLE, pending_nodes
+
+        if LANGGRAPH_AVAILABLE:
+            remaining = []
+            for aid, org_id in targets:
+                pending = await pending_nodes(aid)
+                if not pending:
+                    remaining.append((aid, org_id))
+                    continue
+                async with sm() as session:
+                    await write_audit(
+                        session,
+                        org_id=org_id,
+                        assessment_id=aid,
+                        event="assessment.resumed",
+                        data={"mode": "checkpoint", "next": pending},
+                    )
+                    await session.commit()
+                start_assessment(aid)
+                resumed.append(aid)
+            targets = remaining
+
     for aid, org_id in targets:
         async with sm() as session:
             cp = (
@@ -261,7 +301,7 @@ async def resume_incomplete_assessments() -> list[str]:
                 org_id=org_id,
                 assessment_id=aid,
                 event="assessment.resumed",
-                data={"from_checkpoint": last_phase},
+                data={"mode": "restart", "from_checkpoint": last_phase},
             )
             await session.commit()
         start_assessment(aid)
@@ -280,6 +320,44 @@ class AssessmentEngine:
             max_cost_usd=self.settings.max_llm_cost_usd_per_assessment,
             cost_per_1k_tokens_usd=self.settings.llm_cost_per_1k_tokens_usd,
         )
+        # E-03: why execution did (not) happen; folded into `completion_reason`.
+        self._exec_note = ""
+        # H-02: check_name -> skill_ref for the declarative checks this run executes.
+        self._skill_refs: dict[str, str] = {}
+
+    # ------------------------------------------------------------------ #
+    # H-02: declarative checks are frozen per run
+    # ------------------------------------------------------------------ #
+    async def _declaratives(self, session: AsyncSession, org_id: str | None):
+        """Return the declarative checks this run executes.
+
+        The first call (planning) loads the registry and freezes the runnable specs on
+        the assessment (`skill_snapshot`); every later phase — including approved-step
+        execution after completion and a resumed run — rebuilds the checks from that
+        snapshot, so a registry change mid-run cannot alter a running assessment.
+        """
+        assessment = await session.get(Assessment, self.assessment_id)
+        snapshot = list(assessment.skill_snapshot or []) if assessment else []
+        if snapshot:
+            checks = checks_from_snapshot(snapshot)
+        else:
+            checks = await load_declarative_checks(session, org_id)
+            if assessment is not None:
+                assessment.skill_snapshot = snapshot_specs(checks)
+                # Commit now: the calling phase may otherwise close its session
+                # without committing (planning is read-mostly).
+                await session.commit()
+        self._skill_refs = {
+            c.name: str(c.manifest.get("skill_ref", "")) for c in checks
+        }
+        return checks
+
+    def _skill_ref_for(self, check_name: str) -> str:
+        if not check_name:
+            return ""
+        if check_registry.get(check_name) is not None:
+            return f"{check_name}@builtin#{__import__('app').__version__}"
+        return self._skill_refs.get(check_name, f"{check_name}@?#unknown")
 
     # ------------------------------------------------------------------ #
     # Phase driver
@@ -632,7 +710,7 @@ class AssessmentEngine:
             views = [_endpoint_view(e) for e in plan_endpoints]
             org_id = assessment.org_id
             # Runtime-registered declarative checks (AG-09) participate alongside builtins.
-            declaratives = await load_declarative_checks(session, org_id)
+            declaratives = await self._declaratives(session, org_id)
             planned = await build_plan(
                 views,
                 authorized_check_classes=effective,
@@ -698,13 +776,16 @@ class AssessmentEngine:
     # Phase: policy — evaluate each planned step against the authorization record
     # ------------------------------------------------------------------ #
     async def _phase_policy(
-        self, guard: ScopeGuard, steps: list[PlanStep]
+        self, guard: ScopeGuard, steps: list[PlanStep], *, wait: bool = True
     ) -> list[PlanStep]:
+        """Deterministic policy gate. ``wait=False`` (graph mode) returns immediately
+        with held steps left ``awaiting_approval``; the graph parks on an interrupt
+        instead of polling (B-04)."""
         allowed: list[PlanStep] = []
         held: list[str] = []  # CP-03: steps waiting for per-action operator approval
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
-            declaratives = await load_declarative_checks(session, assessment.org_id)
+            declaratives = await self._declaratives(session, assessment.org_id)
             for step in steps:
                 s = await session.get(PlanStep, step.id)
                 check = _resolve_check(s.check_name, s.check_class, declaratives)
@@ -758,9 +839,22 @@ class AssessmentEngine:
             await session.commit()
             # reload approved steps detached
             ids = [s.id for s in allowed]
-        if held:
+        if held and wait:
             ids.extend(await self._await_step_approvals(held))
         return await self._reload_steps(ids)
+
+    async def held_step_ids(self) -> list[str]:
+        """Plan steps still awaiting per-action approval (CP-03 / B-04)."""
+        async with self._sm() as session:
+            rows = (
+                await session.execute(
+                    select(PlanStep.id).where(
+                        PlanStep.assessment_id == self.assessment_id,
+                        PlanStep.status == "awaiting_approval",
+                    )
+                )
+            ).all()
+        return [r[0] for r in rows]
 
     async def _await_step_approvals(self, step_ids: list[str]) -> list[str]:
         """Bounded wait for operator decisions on held steps (CP-03).
@@ -803,6 +897,7 @@ class AssessmentEngine:
         self, client: GuardedHttpClient, guard: ScopeGuard, steps: list[PlanStep]
     ) -> None:
         if not steps:
+            self._exec_note = "no_execution:no_approved_steps"
             return
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
@@ -833,13 +928,17 @@ class AssessmentEngine:
             phase="coordinate",
         )
         if coord_decision.action == "stop":
+            self._exec_note = "no_execution:coordinator_stop"
             async with self._sm() as session:
                 await write_audit(
                     session,
                     org_id=org_id0,
                     assessment_id=self.assessment_id,
                     event="execution.skipped",
-                    data={"reason": "coordinator elected to stop"},
+                    data={
+                        "reason": "coordinator elected to stop",
+                        "brain_reasoning": coord_decision.reasoning,
+                    },
                 )
                 await session.commit()
             return
@@ -864,7 +963,7 @@ class AssessmentEngine:
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
             org_id = assessment.org_id
-            declaratives = await load_declarative_checks(session, org_id)
+            declaratives = await self._declaratives(session, org_id)
 
         # Build one agent per approved step. This is where 100+ agents materialize.
         agents = []
@@ -953,6 +1052,7 @@ class AssessmentEngine:
                     errored.append(aid)
 
         if stop_reason:
+            self._exec_note = f"partial:{stop_reason}"
             async with self._sm() as session:
                 await write_audit(
                     session,
@@ -1194,7 +1294,7 @@ class AssessmentEngine:
                 )
                 controller = _ExecController(deadline=deadline, client=client)
                 async with self._sm() as session:
-                    declaratives = await load_declarative_checks(session, org_id)
+                    declaratives = await self._declaratives(session, org_id)
                 found = await self._execute_step_batch(
                     client,
                     guard,
@@ -1352,6 +1452,7 @@ class AssessmentEngine:
             remediation=rf.remediation,
             dedup_key=dedup_key,
             reproduction=rf.reproduction,
+            skill_ref=self._skill_ref_for(step.check_name if step else ""),
         )
         session.add(finding)
         await session.flush()
@@ -1738,23 +1839,47 @@ class AssessmentEngine:
             a = await session.get(Assessment, self.assessment_id)
             if a is None:
                 return
+            previous = a.state
             a.state = state.value
             if started and a.started_at is None:
                 a.started_at = datetime.now(UTC)
             if finished:
                 a.finished_at = datetime.now(UTC)
+            if state is AssessmentState.COMPLETED:
+                a.completion_reason = await self._completion_reason(session)
             await write_audit(
                 session,
                 org_id=a.org_id,
                 assessment_id=self.assessment_id,
                 event="state.transition",
-                data={"state": state.value},
+                data={"state": state.value, "completion_reason": a.completion_reason or ""},
             )
             await session.commit()
+        await hooks.run(
+            "post_phase",
+            {"assessment_id": self.assessment_id, "from": previous, "to": state.value},
+        )
+
+    async def _completion_reason(self, session: AsyncSession) -> str:
+        """Evidence-based completion (E-03): a run only counts as 'executed' when at
+        least one job actually ran; otherwise the state carries *why* nothing ran."""
+        jobs = (
+            await session.execute(
+                select(func.count(Job.id)).where(Job.assessment_id == self.assessment_id)
+            )
+        ).scalar_one()
+        if jobs == 0:
+            return self._exec_note or "no_execution:no_jobs"
+        if self._exec_note.startswith("partial:"):
+            return self._exec_note
+        return "executed"
 
     async def _checkpoint(
         self, next_state: AssessmentState, cursor: dict | None = None
     ) -> None:
+        await hooks.run(
+            "pre_phase", {"assessment_id": self.assessment_id, "phase": next_state.value}
+        )
         async with self._sm() as session:
             a = await session.get(Assessment, self.assessment_id)
             cp = (
@@ -1792,6 +1917,21 @@ class AssessmentEngine:
                 assessment_id=self.assessment_id,
                 event="assessment.cancelled",
                 data={},
+            )
+            await session.commit()
+
+    async def mark_parked(self, held: list[str]) -> None:
+        """Audit that the graph parked this run on per-action approvals (B-04)."""
+        async with self._sm() as session:
+            a = await session.get(Assessment, self.assessment_id)
+            if a is None:
+                return
+            await write_audit(
+                session,
+                org_id=a.org_id,
+                assessment_id=self.assessment_id,
+                event="assessment.parked",
+                data={"awaiting_approval": list(held)},
             )
             await session.commit()
 
@@ -1902,7 +2042,10 @@ class AssessmentEngine:
             )
             for s in steps:
                 session.expunge(s)
-        await self._phase_policy(guard, steps)
+        # B-04: never poll in graph mode — the graph parks on an interrupt when steps
+        # are held (see graph.py) and resumes once an operator decides.
+        await self._phase_policy(guard, steps, wait=False)
+        return await self.held_step_ids()
 
     async def node_execute(self) -> None:
         await self._checkpoint(AssessmentState.EXECUTING)

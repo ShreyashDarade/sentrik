@@ -341,10 +341,54 @@ def _rank_params(params: list[dict]) -> list[str]:
 
 
 def _truncate_context(ctx: dict, limit: int = 4000) -> dict:
-    text = json.dumps(ctx, default=str)
-    if len(text) <= limit:
+    """Backward-compatible alias — see ``_compact_context`` (G-04)."""
+    return _compact_context(ctx, limit)
+
+
+def _compact_context(ctx: dict, limit: int = 4000, *, max_str: int = 200) -> dict:
+    """Deterministic context compaction (G-04 / CC-03).
+
+    The brain's context must fit a character budget *and* stay valid, meaningful JSON
+    (the old behaviour cut the serialized text mid-token). Strategy, applied only as far
+    as needed: (1) shorten long strings, (2) trim the longest list from its tail — lists
+    are pre-ranked so the head is the most useful part — (3) drop the largest remaining
+    key. A ``_compacted`` marker records what was removed so the decision trail is honest.
+    """
+
+    def size(obj) -> int:
+        return len(json.dumps(obj, default=str))
+
+    if size(ctx) <= limit:
         return ctx
-    return {"_truncated": True, "preview": text[:limit]}
+    out: dict = json.loads(json.dumps(ctx, default=str))
+    note: dict = {"strings_shortened": 0, "lists_trimmed": {}, "keys_dropped": []}
+
+    def shorten(obj):
+        if isinstance(obj, str) and len(obj) > max_str:
+            note["strings_shortened"] += 1
+            return obj[:max_str] + "…"
+        if isinstance(obj, list):
+            return [shorten(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: shorten(v) for k, v in obj.items()}
+        return obj
+
+    out = shorten(out)
+    # (2) trim the longest top-level list, one element at a time from the tail
+    while size(out) + size(note) > limit:
+        lists = [(k, v) for k, v in out.items() if isinstance(v, list) and len(v) > 1]
+        if not lists:
+            break
+        k, v = max(lists, key=lambda kv: size(kv[1]))
+        out[k] = v[:-1]
+        note["lists_trimmed"][k] = note["lists_trimmed"].get(k, 0) + 1
+    # (3) drop the largest remaining key
+    while size(out) + size(note) > limit and out:
+        k = max(out, key=lambda key: size(out[key]))
+        del out[k]
+        note["keys_dropped"].append(k)
+    out["_compacted"] = note
+    return out
 
 
 def _langchain_usage(resp) -> tuple[int, int]:

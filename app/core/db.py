@@ -60,12 +60,46 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """Create tables from the ORM metadata (idempotent). Called on app startup."""
+    """Create tables from the ORM metadata and add any missing columns (idempotent).
+
+    ``create_all`` only creates *tables*; it never alters existing ones. The additive
+    column sync below makes the documented deploy path ("new tables and columns appear
+    on startup") actually true for databases created by an earlier version.
+    """
     from app import models  # noqa: F401  ensure models are registered
 
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+
+
+def _add_missing_columns(sync_conn) -> None:
+    """ALTER TABLE … ADD COLUMN for ORM columns absent from an existing table."""
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(sync_conn)
+    dialect = sync_conn.dialect
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            continue
+        present = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in present:
+                continue
+            col_type = column.type.compile(dialect=dialect)
+            default = ""
+            if column.default is not None and getattr(column.default, "is_scalar", False):
+                arg = column.default.arg
+                if isinstance(arg, bool):
+                    default = f" DEFAULT {1 if arg else 0}"
+                elif isinstance(arg, int | float):
+                    default = f" DEFAULT {arg}"
+                elif isinstance(arg, str):
+                    default = " DEFAULT '" + arg.replace("'", "''") + "'"
+            sync_conn.exec_driver_sql(
+                f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}{default}'
+            )
 
 
 async def reset_engine() -> None:

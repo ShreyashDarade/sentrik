@@ -150,6 +150,39 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
     return "", text
 
 
+class SkillVersionConflict(ValueError):
+    """Raised when an existing (org, name, version) is re-registered with different
+    content (H-02). Versions are immutable: bump the version instead."""
+
+    def __init__(self, name: str, version: str, existing_id: str):
+        super().__init__(
+            f"skill {name}@{version} already registered with different content; "
+            "bump the version"
+        )
+        self.name = name
+        self.version = version
+        self.existing_id = existing_id
+
+
+_MUTABLE_MANIFEST_KEYS = ("validation", "tested", "body_preview")
+
+
+def manifest_hash(payload: dict) -> str:
+    """Stable content hash of a stored manifest (ignores bookkeeping keys)."""
+    import hashlib
+    import json
+
+    stable = {k: v for k, v in (payload or {}).items() if k not in _MUTABLE_MANIFEST_KEYS}
+    return hashlib.sha256(
+        json.dumps(stable, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def skill_ref(name: str, version: str, payload: dict | None) -> str:
+    """Provenance reference recorded on findings: ``name@version#hash8``."""
+    return f"{name}@{version}#{manifest_hash(payload or {})[:8]}"
+
+
 async def register_manifest(
     session: AsyncSession,
     manifest: SkillManifest,
@@ -186,8 +219,14 @@ async def register_manifest(
     }
     enabled = not manifest.needs_code
     if existing:
-        existing.manifest = payload
-        existing.check_class = manifest.check_class
+        # H-02: versions are immutable. Identical content is an idempotent no-op;
+        # different content under the same version is a conflict.
+        same = (
+            manifest_hash(existing.manifest or {}) == manifest_hash(payload)
+            and existing.check_class == manifest.check_class
+        )
+        if not same:
+            raise SkillVersionConflict(manifest.name, manifest.version, existing.id)
         existing.enabled = enabled
         existing.provenance = provenance
         return existing
@@ -210,15 +249,23 @@ def _manifest_to_check(row: AgentSkill) -> DeclarativeCheck | None:
     m = row.manifest or {}
     if not m.get("declarative") or not row.enabled:
         return None
-    spec = {
-        "name": row.name,
-        "version": row.version,
-        "check_class": row.check_class,
+    return build_declarative_check(
+        _row_spec(row.name, row.version, row.check_class, m)
+    )
+
+
+def _row_spec(name: str, version: str, check_class: str, m: dict) -> dict:
+    """The runnable spec for a stored manifest (also what a run snapshot stores)."""
+    return {
+        "name": name,
+        "version": version,
+        "check_class": check_class,
+        "skill_ref": skill_ref(name, version, m),
         "intensity": m.get("intensity", "passive"),
         "cwe": m.get("cwe", ""),
         "severity": m.get("severity", "medium"),
         "confidence": m.get("confidence", "medium"),
-        "title": m.get("title", row.name),
+        "title": m.get("title", name),
         "description": m.get("description", ""),
         "remediation": m.get("remediation", ""),
         "detector": m.get("detector"),
@@ -227,7 +274,16 @@ def _manifest_to_check(row: AgentSkill) -> DeclarativeCheck | None:
         # policy phase can enforce it (e.g. a check that must only run in staging/dev).
         "allowed_environments": (m.get("policy") or {}).get("environments", []),
     }
-    return build_declarative_check(spec)
+
+
+def snapshot_specs(checks: list[DeclarativeCheck]) -> list[dict]:
+    """Freeze the runnable specs of declarative checks for a run (H-02)."""
+    return [dict(c.manifest) for c in checks]
+
+
+def checks_from_snapshot(snapshot: list | None) -> list[DeclarativeCheck]:
+    """Rebuild the exact checks a run planned with, from its frozen snapshot."""
+    return [build_declarative_check(dict(spec)) for spec in (snapshot or [])]
 
 
 async def load_declarative_checks(

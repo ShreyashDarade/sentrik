@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -489,6 +489,18 @@ async def cancel(
         event="assessment.cancel_requested",
         data={},
     )
+    # A run with no live task (never started, or parked on an approval interrupt in
+    # graph mode — B-04) has nothing to honour the flag, so finalize it right here.
+    if not orchestrator.is_running(assessment_id):
+        a.state = AssessmentState.CANCELLED.value
+        a.finished_at = datetime.now(UTC)
+        await write_audit(
+            session,
+            org_id=principal.org_id,
+            assessment_id=assessment_id,
+            event="assessment.cancelled",
+            data={"while": "not_running"},
+        )
     await session.commit()
     await session.refresh(a)
     return _assessment_out(a)
@@ -582,7 +594,25 @@ async def approve_step(
         AssessmentState.FAILED.value,
     ):
         orchestrator.start_approved_steps(assessment_id, [step_id])
+    else:
+        await _resume_if_parked(session, a)
     return _step_out(step)
+
+
+async def _resume_if_parked(session: AsyncSession, a: Assessment) -> None:
+    """B-04: a graph-mode run parked on approvals continues once nothing is held."""
+    if orchestrator.is_running(a.id) or a.state != AssessmentState.POLICY_CHECK.value:
+        return
+    remaining = (
+        await session.execute(
+            select(func.count(PlanStep.id)).where(
+                PlanStep.assessment_id == a.id,
+                PlanStep.status == "awaiting_approval",
+            )
+        )
+    ).scalar_one()
+    if remaining == 0:
+        orchestrator.start_assessment(a.id)
 
 
 @router.post(
@@ -613,6 +643,9 @@ async def deny_step(
     )
     await session.commit()
     await session.refresh(step)
+    a = await session.get(Assessment, assessment_id)
+    if a is not None:
+        await _resume_if_parked(session, a)
     return _step_out(step)
 
 
@@ -1309,6 +1342,7 @@ def _assessment_out(a: Assessment) -> AssessmentOut:
         previous_assessment_id=a.previous_assessment_id,
         requests_made=a.requests_made,
         error=a.error,
+        completion_reason=a.completion_reason or "",
         summary=a.summary or {},
         created_at=a.created_at,
         started_at=a.started_at,
@@ -1331,6 +1365,7 @@ def _finding_out(f: Finding) -> FindingOut:
         risk_breakdown=f.risk_breakdown or {},
         reproduction=f.reproduction or {},
         endpoint_id=f.endpoint_id,
+        skill_ref=f.skill_ref or "",
     )
 
 
