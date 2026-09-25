@@ -25,7 +25,7 @@ from app.api.schemas import (
 )
 from app.core.auth import Principal, get_principal, require_role
 from app.core.db import get_session, get_sessionmaker
-from app.core.enums import AssessmentState, FindingStatus, Role, VerificationStatus
+from app.core.enums import AssessmentState, FindingStatus, Role
 from app.models import (
     Assessment,
     AuthorizationRecord,
@@ -43,6 +43,12 @@ from app.orchestration import engine as orchestrator
 from app.security.http_client import GuardedHttpClient
 from app.security.scope import ScopeGuard
 from app.services import reporting
+from app.services.assessment_service import (
+    AssessmentCreateError,
+    build_report,
+    finding_dict,
+)
+from app.services.assessment_service import create_assessment as create_assessment_record
 from app.services.audit import list_audit, write_audit
 from app.services.regression import build_regression_definition, run_regression
 
@@ -58,53 +64,17 @@ async def create_assessment(
     principal: Principal = Depends(require_role(Role.OPERATOR)),
     session: AsyncSession = Depends(get_session),
 ):
-    target = await session.get(Target, body.target_id)
-    if not target or target.org_id != principal.org_id:
-        raise HTTPException(status_code=404, detail="target not found")
-    record = await session.get(AuthorizationRecord, body.authorization_id)
-    if (
-        not record
-        or record.org_id != principal.org_id
-        or record.target_id != body.target_id
-    ):
-        raise HTTPException(
-            status_code=404, detail="authorization not found for target"
+    try:
+        assessment = await create_assessment_record(
+            session,
+            org_id=principal.org_id,
+            target_id=body.target_id,
+            authorization_id=body.authorization_id,
+            requested_check_classes=body.requested_check_classes,
+            artifacts=[art.model_dump() for art in body.artifacts],
         )
-    if record.status != VerificationStatus.VERIFIED.value:
-        raise HTTPException(
-            status_code=403,
-            detail=f"authorization not verified (status={record.status}); "
-            "verify ownership and re-create the authorization",
-        )
-
-    assessment = Assessment(
-        org_id=principal.org_id,
-        target_id=body.target_id,
-        authorization_id=body.authorization_id,
-        state=AssessmentState.CREATED.value,
-        requested_check_classes=body.requested_check_classes,
-    )
-    session.add(assessment)
-    await session.flush()
-
-    for art in body.artifacts:
-        session.add(
-            DiscoveryArtifact(
-                org_id=principal.org_id,
-                assessment_id=assessment.id,
-                kind=art.kind,
-                filename=art.filename,
-                content=art.content,
-                endpoint_url=art.endpoint_url,
-            )
-        )
-    await write_audit(
-        session,
-        org_id=principal.org_id,
-        assessment_id=assessment.id,
-        event="assessment.created",
-        data={"target_id": body.target_id},
-    )
+    except AssessmentCreateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     await session.commit()
     await session.refresh(assessment)
     return _assessment_out(assessment)
@@ -842,83 +812,7 @@ async def report(
     session: AsyncSession = Depends(get_session),
 ):
     a = await _get_assessment(session, principal, assessment_id)
-    target = await session.get(Target, a.target_id)
-    record = await session.get(AuthorizationRecord, a.authorization_id)
-    endpoints = (
-        (
-            await session.execute(
-                select(Endpoint).where(Endpoint.assessment_id == assessment_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    findings = (
-        (
-            await session.execute(
-                select(Finding).where(Finding.assessment_id == assessment_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    cov = (
-        (
-            await session.execute(
-                select(Coverage).where(Coverage.assessment_id == assessment_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    payload = reporting.build_report_payload(
-        emphasis=(a.summary or {}).get("report_emphasis", reporting.EMPHASES[0]),
-        assessment={
-            "id": a.id,
-            "state": a.state,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-            "finished_at": a.finished_at.isoformat() if a.finished_at else None,
-        },
-        target={
-            "name": target.name,
-            "base_url": target.base_url,
-            "environment": target.environment,
-        },
-        authorization={
-            "id": record.id,
-            "status": record.status,
-            "environment": record.environment,
-            "intensity": record.intensity,
-            "authorized_by": record.authorized_by,
-            "window_start": record.window_start.isoformat()
-            if record.window_start
-            else None,
-            "window_end": record.window_end.isoformat() if record.window_end else None,
-        },
-        endpoints=[
-            {
-                "id": e.id,
-                "method": e.method,
-                "url": e.url,
-                "provenance": e.provenance,
-                "confidence": e.confidence,
-                "auth_required": e.auth_required,
-            }
-            for e in endpoints
-        ],
-        findings=[_finding_dict(f) for f in findings],
-        coverage=[
-            {
-                "endpoint_id": c.endpoint_id,
-                "check_class": c.check_class,
-                "tested": c.tested,
-                "reason_untested": c.reason_untested,
-            }
-            for c in cov
-        ],
-        risk=(a.summary or {}).get("risk", {}),
-    )
+    payload = await build_report(session, a)
     if fmt == "markdown":
         return Response(
             content=reporting.render_markdown(payload), media_type="text/markdown"
@@ -1370,16 +1264,4 @@ def _finding_out(f: Finding) -> FindingOut:
 
 
 def _finding_dict(f: Finding) -> dict:
-    return {
-        "id": f.id,
-        "check_class": f.check_class,
-        "title": f.title,
-        "severity": f.severity,
-        "confidence": f.confidence,
-        "status": f.status,
-        "cwe": f.cwe,
-        "description": f.description,
-        "remediation": f.remediation,
-        "risk_score": f.risk_score,
-        "reproduction": f.reproduction or {},
-    }
+    return finding_dict(f)

@@ -61,7 +61,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         log.warning("assessment resume sweep skipped", exc_info=True)
     log.info("Sentrik %s started (env=%s)", __version__, get_settings().environment)
-    yield
+    try:
+        yield
+    finally:
+        mcp_app = getattr(app.state, "mcp_app", None)
+        if mcp_app is not None:
+            # The streamable-HTTP session manager starts on first use (F-02); stop it
+            # with the application.
+            await mcp_app.shutdown()
 
 
 def _error_envelope(
@@ -77,6 +84,35 @@ def _error_envelope(
             }
         },
     )
+
+
+def _mount_protocol_endpoints(app: FastAPI) -> None:
+    """MCP over streamable-HTTP at /mcp and the A2A binding at /a2a (F-02 / F-05).
+
+    Both sit behind ``ProtocolAuthMiddleware`` (same credentials as the REST API);
+    the A2A agent card is public.
+    """
+    settings = get_settings()
+    app.state.mcp_app = None
+    app.state.agent_card = None
+    if not settings.protocol_endpoints_enabled:
+        return
+    from app.integrations.protocol_auth import ProtocolAuthMiddleware
+
+    app.add_middleware(ProtocolAuthMiddleware)
+    # MCP over streamable-HTTP: a build failure must surface at startup, not be hidden.
+    from app.integrations.mcp_server import build_http_app
+
+    app.state.mcp_app = build_http_app()
+    app.mount("/mcp", app.state.mcp_app, name="mcp")
+    # A2A (Google a2a-sdk) is a required dependency: mounted unconditionally.
+    from a2a.server.routes import add_a2a_routes_to_fastapi
+
+    from app.integrations.a2a_server import build_a2a_routes
+
+    card_routes, rpc_routes, card = build_a2a_routes(rpc_path="/a2a")
+    add_a2a_routes_to_fastapi(app, agent_card_routes=card_routes, jsonrpc_routes=rpc_routes)
+    app.state.agent_card = card
 
 
 def create_app() -> FastAPI:
@@ -101,6 +137,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(connectors.router)
     app.include_router(memory.router)
+    _mount_protocol_endpoints(app)
 
     # ---- uniform error envelope across the API ----
     @app.exception_handler(ScopeViolation)

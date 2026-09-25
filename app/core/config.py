@@ -112,6 +112,19 @@ class Settings(BaseSettings):
     s3_access_key: str = ""
     s3_secret_key: str = ""
 
+    # --- protocol endpoints (F-02 / F-05) ---
+    # MCP over streamable-HTTP is served at /mcp and the A2A JSON-RPC binding at /a2a
+    # (agent card at /.well-known/agent-card.json). Both require the same API key /
+    # Bearer JWT as the REST API; every call stays tenant-scoped.
+    protocol_endpoints_enabled: bool = True
+    # Externally reachable base URL advertised in the A2A agent card.
+    public_base_url: str = "http://127.0.0.1:8000"
+    # Extra Host values the MCP transport accepts (comma-separated; loopback and the
+    # public_base_url host are always accepted). Protects against DNS rebinding.
+    mcp_allowed_hosts: str = ""
+    # Longest an A2A message/send waits for an assessment before returning WORKING.
+    a2a_task_wait_seconds: int = 900
+
     # --- per-run sandbox (egress isolation) ---
     # "none" (guarded egress only), "process" (asyncio-isolated worker), or "container"
     # (documented deploy profile). Egress is always funnelled through GuardedHttpClient.

@@ -13,7 +13,9 @@ tool schema list) so the tool surface is inspectable/testable offline.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Any
 
 from app.checks.base import registry
 
@@ -21,10 +23,13 @@ log = logging.getLogger("sentrik.mcp")
 
 try:
     from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
 
     MCP_AVAILABLE = True
 except Exception:  # noqa: BLE001  pragma: no cover
     MCP_AVAILABLE = False
+
+from app.integrations.protocol_auth import current_org_id
 
 
 def build_tools() -> list[dict]:
@@ -91,12 +96,15 @@ async def _run_check_bound(
     url: str,
     method: str = "GET",
     auth_required: bool = False,
+    org_id: str | None = None,
 ) -> dict:
     """Execute one check against a URL under a stored authorization record's scope.
 
     ``auth_required`` is caller-declared (the MCP client knows its endpoint; we do not
     probe for it here) and is echoed back in the result so consumers can see the
-    assumption that fed exposure scoring.
+    assumption that fed exposure scoring. ``org_id`` (set for HTTP callers by the
+    protocol auth middleware) tenant-scopes the authorization lookup; over stdio the
+    local operator is trusted with the database they already own.
     """
     from sqlalchemy import select
 
@@ -120,7 +128,7 @@ async def _run_check_bound(
                 )
             )
         ).scalar_one_or_none()
-    if record is None:
+    if record is None or (org_id and record.org_id != org_id):
         return {"error": "authorization record not found"}
 
     guard = ScopeGuard(record)
@@ -220,6 +228,7 @@ def build_server():
     @server.tool(
         name="run_check",
         description="Run a named security check against a URL within an authorized scope.",
+        structured_output=True,
     )
     async def run_check(
         authorization_id: str,
@@ -227,9 +236,16 @@ def build_server():
         url: str,
         method: str = "GET",
         auth_required: bool = False,
-    ) -> dict:
-        return await _run_check_bound(
-            authorization_id, check_name, url, method, auth_required
+    ) -> dict[str, Any]:
+        return _raise_on_error(
+            await _run_check_bound(
+                authorization_id,
+                check_name,
+                url,
+                method,
+                auth_required,
+                org_id=current_org_id(),
+            )
         )
 
     # one thin tool per registered check
@@ -238,7 +254,145 @@ def build_server():
             server, c.name, c.check_class.value, c.intensity.value, c.cwe
         )
 
+    @server.resource(
+        "sentrik://assessments/{assessment_id}/report",
+        name="assessment_report",
+        description=(
+            "Full JSON report (findings, evidence lineage, coverage, risk) of an "
+            "assessment owned by the calling organization."
+        ),
+        mime_type="application/json",
+    )
+    async def assessment_report(assessment_id: str) -> str:
+        return await _report_json(assessment_id, current_org_id())
+
     return server
+
+
+def _raise_on_error(result: dict) -> dict:
+    """Protocol-correct failure signalling (F-03): scope/authorization failures are
+    tool *execution* errors, so callers get ``isError: true`` instead of a payload
+    they would have to parse."""
+    if "error" in result:
+        raise ToolError(str(result["error"]))
+    return result
+
+
+async def _report_json(assessment_id: str, org_id: str | None) -> str:
+    import json
+
+    from app.core.db import get_sessionmaker
+    from app.models import Assessment
+    from app.services.assessment_service import build_report
+
+    async with get_sessionmaker()() as session:
+        a = await session.get(Assessment, assessment_id)
+        if a is None or (org_id and a.org_id != org_id):
+            raise ValueError("assessment not found")
+        return json.dumps(await build_report(session, a), default=str)
+
+
+def build_http_app(server=None, *, path: str = "/"):
+    """ASGI app serving the MCP server over streamable-HTTP (spec 2026-07-28).
+
+    Mounted by the API at ``/mcp`` (F-02). Requests are authenticated by
+    ``ProtocolAuthMiddleware`` (same API key / JWT as the REST API) and every tool
+    is tenant-scoped through ``current_org_id()``. Host/Origin validation guards
+    against DNS rebinding: loopback, the ``public_base_url`` host and
+    ``mcp_allowed_hosts`` are accepted.
+    """
+    from urllib.parse import urlsplit
+
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    hosts = {"127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*", "testserver"}
+    origins = {"http://127.0.0.1", "http://localhost"}
+    public = urlsplit(settings.public_base_url)
+    if public.hostname:
+        hosts.update({public.hostname, f"{public.hostname}:*"})
+        origins.add(f"{public.scheme}://{public.netloc}")
+    for extra in (settings.mcp_allowed_hosts or "").split(","):
+        extra = extra.strip()
+        if extra:
+            hosts.update({extra, f"{extra}:*"})
+            origins.update({f"http://{extra}", f"https://{extra}"})
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=sorted(hosts),
+        allowed_origins=sorted(origins),
+    )
+    server = server or build_server()
+    return LazyMcpApp(
+        lambda: server.streamable_http_app(
+            streamable_http_path=path, stateless_http=True, transport_security=security
+        )
+    )
+
+
+class LazyMcpApp:
+    """ASGI wrapper that starts the MCP streamable-HTTP session manager on demand.
+
+    ``MCPServer.streamable_http_app()`` needs its lifespan (the session manager) to be
+    running, and Starlette does not propagate lifespan events to mounted apps. This
+    wrapper owns that lifecycle: the inner app is created and its lifespan entered on
+    the first request of an event loop, kept open in a background task, and closed by
+    ``shutdown()`` (called from the API lifespan). A new event loop (tests) gets a
+    fresh inner app because a session manager can only be run once.
+    """
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._loop = None
+        self._inner = None
+        self._runner: asyncio.Task | None = None
+        self._ready: asyncio.Event | None = None
+        self._stop: asyncio.Event | None = None
+
+    async def _ensure_started(self):
+        loop = asyncio.get_running_loop()
+        if self._inner is not None and self._loop is loop and self._runner and not self._runner.done():
+            await self._ready.wait()
+            return self._inner
+        self._loop = loop
+        self._inner = self._factory()
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+        inner, ready, stop = self._inner, self._ready, self._stop
+
+        async def _run():
+            async with inner.router.lifespan_context(inner):
+                ready.set()
+                await stop.wait()
+
+        self._runner = loop.create_task(_run())
+        await ready.wait()
+        return inner
+
+    async def shutdown(self) -> None:
+        if self._stop is not None and self._runner is not None and not self._runner.done():
+            self._stop.set()
+            try:
+                await asyncio.wait_for(self._runner, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        self._inner = None
+        self._runner = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":  # handled by our own runner
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await self.shutdown()
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        inner = await self._ensure_started()
+        await inner(scope, receive, send)
 
 
 def _register_check_tool(
@@ -246,15 +400,22 @@ def _register_check_tool(
 ):
     async def _tool(
         authorization_id: str, url: str, auth_required: bool = False
-    ) -> dict:
-        return await _run_check_bound(
-            authorization_id, check_name, url, auth_required=auth_required
+    ) -> dict[str, Any]:
+        return _raise_on_error(
+            await _run_check_bound(
+                authorization_id,
+                check_name,
+                url,
+                auth_required=auth_required,
+                org_id=current_org_id(),
+            )
         )
 
     _tool.__name__ = f"check_{check_name.replace('.', '_')}"
     server.tool(
         name=f"check.{check_name}",
         description=f"{check_class} check ({intensity}, {cwe}); bound to authorized scope.",
+        structured_output=True,
     )(_tool)
 
 
@@ -268,10 +429,14 @@ def serve_stdio() -> None:
             "sentrik": {
               "command": "python",
               "args": ["-m", "app.integrations.mcp_server"],
-              "env": {"SENTINEL_DATABASE_URL": "sqlite+aiosqlite:///./sentinel.db"}
+              "env": {"SENTINEL_DATABASE_URL": "sqlite+aiosqlite:///./sentrik.db"}
             }
           }
         }
+
+    Remote clients use the streamable-HTTP endpoint served by the API instead
+    (``claude mcp add --transport http sentrik https://<host>/mcp/`` with header
+    ``X-API-Key: <key>``); see ``build_http_app``.
 
     Every tool call remains bound to a stored, verified AuthorizationRecord and is routed
     through the deterministic ScopeGuard + GuardedHttpClient — the MCP client cannot widen
