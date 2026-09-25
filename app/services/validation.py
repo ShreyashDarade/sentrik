@@ -347,6 +347,8 @@ async def _validate_business_flow(client, repro) -> ValidationOutcome:
             variables[var] = str(data[key])
             if var == flow.invariant_var:
                 observed = data[key]
+    if observed is None:
+        return ValidationOutcome(FindingStatus.INCONCLUSIVE, "no_value", "no invariant value")
     try:
         numeric = float(observed)
     except (ValueError, TypeError):

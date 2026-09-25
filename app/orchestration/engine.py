@@ -53,7 +53,7 @@ from app.checks.base import RawFinding
 from app.checks.base import registry as check_registry
 from app.checks.context import CheckContext, EndpointView
 from app.core.config import get_settings
-from app.core.db import get_sessionmaker
+from app.core.db import get_sessionmaker, require
 from app.core.enums import (
     TERMINAL_STATES,
     AssessmentState,
@@ -121,7 +121,7 @@ def _org_sem(org_id: str) -> asyncio.Semaphore:
 
 async def _org_id_of(assessment_id: str) -> str | None:
     async with get_sessionmaker()() as session:
-        a = await session.get(Assessment, assessment_id)
+        a = require(await session.get(Assessment, assessment_id), "assessment")
         return a.org_id if a else None
 
 
@@ -297,7 +297,7 @@ async def resume_incomplete_assessments() -> list[str]:
                 )
                 for r in rows:
                     await session.delete(r)
-            a = await session.get(Assessment, aid)
+            a = require(await session.get(Assessment, aid), "assessment")
             a.state = AssessmentState.CREATED.value
             a.cancel_requested = False
             a.requests_made = 0
@@ -341,7 +341,7 @@ class AssessmentEngine:
         execution after completion and a resumed run — rebuilds the checks from that
         snapshot, so a registry change mid-run cannot alter a running assessment.
         """
-        assessment = await session.get(Assessment, self.assessment_id)
+        assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
         snapshot = list(assessment.skill_snapshot or []) if assessment else []
         if snapshot:
             checks = checks_from_snapshot(snapshot)
@@ -515,8 +515,8 @@ class AssessmentEngine:
         self, client: GuardedHttpClient, guard: ScopeGuard
     ) -> list[Endpoint]:
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
-            target = await session.get(Target, assessment.target_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
+            target = require(await session.get(Target, assessment.target_id), "target")
             artifacts = (
                 (
                     await session.execute(
@@ -550,8 +550,8 @@ class AssessmentEngine:
         # the crawl itself is its deterministic, scope-enforced tool (runner).
         async def _crawl_runner() -> None:
             async with self._sm() as session:
-                assessment = await session.get(Assessment, self.assessment_id)
-                target = await session.get(Target, assessment.target_id)
+                assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
+                target = require(await session.get(Target, assessment.target_id), "target")
                 base_url = target.base_url
             try:
                 crawl_eps, crawl_warn = await crawl(
@@ -591,7 +591,7 @@ class AssessmentEngine:
         )
 
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             # mark artifacts parsed (persist across the split session boundary)
             for art in (
                 (
@@ -668,8 +668,8 @@ class AssessmentEngine:
     # ------------------------------------------------------------------ #
     async def _phase_planning(self, endpoints: Sequence[Endpoint]) -> list[PlanStep]:
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
-            record = await session.get(AuthorizationRecord, assessment.authorization_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
+            record = require(await session.get(AuthorizationRecord, assessment.authorization_id), "authorizationrecord")
             n_sessions = (
                 (
                     await session.execute(
@@ -746,7 +746,7 @@ class AssessmentEngine:
         )
 
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             steps: list[PlanStep] = []
             for p in planned:
                 step = PlanStep(
@@ -789,10 +789,10 @@ class AssessmentEngine:
         allowed: list[PlanStep] = []
         held: list[str] = []  # CP-03: steps waiting for per-action operator approval
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             declaratives = await self._declaratives(session, assessment.org_id)
             for step in steps:
-                s = await session.get(PlanStep, step.id)
+                s = require(await session.get(PlanStep, step.id), "planstep")
                 check = _resolve_check(s.check_name, s.check_class, declaratives)
                 if check is None:
                     s.status = "skipped"
@@ -807,7 +807,7 @@ class AssessmentEngine:
                 # may narrow — never widen — what the authorization record already permits.
                 policy_reason, policy_code = _declarative_policy_block(check, guard.record)
                 if decision.allowed and policy_reason:
-                    decision = ScopeDecision(False, policy_reason, code=policy_code)
+                    decision = ScopeDecision(False, policy_reason, code=policy_code or "")
                 s.policy_decision = {
                     "allowed": decision.allowed,
                     "reason": decision.reason,
@@ -905,7 +905,7 @@ class AssessmentEngine:
             self._exec_note = "no_execution:no_approved_steps"
             return
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             org_id0 = assessment.org_id
 
         # CoordinatorAgent (LLM-brained) decides whether to proceed with execution.
@@ -966,7 +966,7 @@ class AssessmentEngine:
         brain = get_brain()
 
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             org_id = assessment.org_id
             declaratives = await self._declaratives(session, org_id)
 
@@ -975,12 +975,15 @@ class AssessmentEngine:
         step_by_agent: dict[str, PlanStep] = {}
         endpoint_cache: dict[str, EndpointView] = {}
         for step in steps:
+            if step.endpoint_id is None:
+                continue
             ev = endpoint_cache.get(step.endpoint_id)
             if ev is None:
-                ev = await self._endpoint_view_by_id(step.endpoint_id)
+                fetched = await self._endpoint_view_by_id(step.endpoint_id)
+                if fetched is None:
+                    continue
+                ev = fetched
                 endpoint_cache[step.endpoint_id] = ev
-            if ev is None:
-                continue
             check = _resolve_check(step.check_name, step.check_class, declaratives)
             if check is None:
                 continue
@@ -1117,7 +1120,7 @@ class AssessmentEngine:
                     "by_role": pool.stats.by_role,
                 },
             )
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             summary = dict(assessment.summary or {})
             summary["agents_instantiated"] = pool.stats.instantiated
             summary["brain_sources"] = pool.stats.brain_sources
@@ -1143,9 +1146,10 @@ class AssessmentEngine:
                 return
 
             async with self._sm() as session:
-                assessment = await session.get(Assessment, self.assessment_id)
-                record = await session.get(
-                    AuthorizationRecord, assessment.authorization_id
+                assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
+                record = require(
+                    await session.get(AuthorizationRecord, assessment.authorization_id),
+                    "authorization",
                 )
                 endpoints = (
                     (
@@ -1279,7 +1283,7 @@ class AssessmentEngine:
         if not precheck.allowed or not org_id:
             async with self._sm() as session:
                 for s in steps:
-                    row = await session.get(PlanStep, s.id)
+                    row = require(await session.get(PlanStep, s.id), "planstep")
                     row.status = "skipped"
                     row.policy_decision = {
                         **(row.policy_decision or {}),
@@ -1340,12 +1344,15 @@ class AssessmentEngine:
         step_by_agent: dict[str, PlanStep] = {}
         cache: dict[str, EndpointView] = {}
         for step in steps:
+            if step.endpoint_id is None:
+                continue
             ev = cache.get(step.endpoint_id)
             if ev is None:
-                ev = await self._endpoint_view_by_id(step.endpoint_id)
+                fetched = await self._endpoint_view_by_id(step.endpoint_id)
+                if fetched is None:
+                    continue
+                ev = fetched
                 cache[step.endpoint_id] = ev
-            if ev is None:
-                continue
             check = _resolve_check(step.check_name, step.check_class, declaratives)
             if check is None:
                 continue
@@ -1411,7 +1418,7 @@ class AssessmentEngine:
             )
             session.add(job)
             if step:
-                s = await session.get(PlanStep, step.id)
+                s = require(await session.get(PlanStep, step.id), "planstep")
                 if s:
                     s.status = "errored" if result.error else "done"
             # decisions → audit lineage
@@ -1434,7 +1441,7 @@ class AssessmentEngine:
         endpoint_id = step.endpoint_id if step else None
         endpoint_fp = ""
         if endpoint_id:
-            ep = await session.get(Endpoint, endpoint_id)
+            ep = require(await session.get(Endpoint, endpoint_id), "endpoint")
             endpoint_fp = ep.fingerprint if ep else ""
         dedup_key = rf.dedup_key(endpoint_fp)
         # dedup within assessment
@@ -1490,7 +1497,7 @@ class AssessmentEngine:
         self, client: GuardedHttpClient, guard: ScopeGuard
     ) -> None:
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             org_id = assessment.org_id
             findings = (
                 (
@@ -1536,7 +1543,7 @@ class AssessmentEngine:
                 outcome = None
                 log.warning("validation error for %s: %s", fid, exc)
             async with self._sm() as session:
-                finding = await session.get(Finding, fid)
+                finding = require(await session.get(Finding, fid), "finding")
                 if outcome is None:
                     finding.status = FindingStatus.INCONCLUSIVE.value
                     detail = "validator raised an error"
@@ -1594,7 +1601,7 @@ class AssessmentEngine:
         from app.models import ProjectMemory
 
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             fp_rows = (
                 (
                     await session.execute(
@@ -1648,8 +1655,8 @@ class AssessmentEngine:
     async def _phase_score(self) -> None:
         await self._apply_known_false_positives()
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
-            record = await session.get(AuthorizationRecord, assessment.authorization_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
+            record = require(await session.get(AuthorizationRecord, assessment.authorization_id), "authorizationrecord")
             org_id = assessment.org_id
             endpoints = (
                 (
@@ -1687,7 +1694,7 @@ class AssessmentEngine:
 
             ep_by_id = {e.id: e for e in endpoints}
             for f in findings:
-                ep = ep_by_id.get(f.endpoint_id)
+                ep = ep_by_id.get(f.endpoint_id) if f.endpoint_id else None
                 res = scoring.score_finding(
                     severity=f.severity,
                     confidence=f.confidence,
@@ -1780,7 +1787,7 @@ class AssessmentEngine:
         # Report is generated on-demand by the reporting router from persisted state;
         # a ReporterAgent records the render decision, then we mark report-ready.
         async with self._sm() as session:
-            assessment = await session.get(Assessment, self.assessment_id)
+            assessment = require(await session.get(Assessment, self.assessment_id), "assessment")
             org_id = assessment.org_id
         async with self._sm() as session:
             n_confirmed = (
@@ -1823,7 +1830,7 @@ class AssessmentEngine:
             else ReporterAgent.EMPHASES[0]
         )
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             # The renderer reads this to order report sections (see services/reporting).
             a.summary = {**(a.summary or {}), "report_emphasis": emphasis}
             await write_audit(
@@ -1891,7 +1898,7 @@ class AssessmentEngine:
             "pre_phase", {"assessment_id": self.assessment_id, "phase": next_state.value}
         )
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             cp = (
                 await session.execute(
                     select(Checkpoint).where(
@@ -1914,13 +1921,13 @@ class AssessmentEngine:
 
     async def _cancelled(self) -> bool:
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             return bool(a and a.cancel_requested)
 
     async def _finish_cancelled(self) -> None:
         await self._set_state(AssessmentState.CANCELLED, finished=True)
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             await write_audit(
                 session,
                 org_id=a.org_id,
@@ -1964,8 +1971,8 @@ class AssessmentEngine:
 
     async def _make_guard(self) -> ScopeGuard:
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
-            record = await session.get(AuthorizationRecord, a.authorization_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
+            record = require(await session.get(AuthorizationRecord, a.authorization_id), "authorizationrecord")
             return ScopeGuard(record, requests_made=a.requests_made or 0)
 
     def _make_sandbox(self, guard: ScopeGuard):
@@ -1981,14 +1988,14 @@ class AssessmentEngine:
         if count % 10 != 0:
             return
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             if a:
                 a.requests_made = count
                 await session.commit()
 
     async def _persist_exact_count(self, count: int) -> None:
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             if a:
                 a.requests_made = count
                 await session.commit()
@@ -2033,7 +2040,7 @@ class AssessmentEngine:
                 session.expunge(e)
         await self._phase_planning(endpoints)
 
-    async def node_policy(self) -> None:
+    async def node_policy(self) -> list[str]:
         await self._checkpoint(AssessmentState.POLICY_CHECK)
         await self._set_state(AssessmentState.POLICY_CHECK)
         guard = await self._make_guard()
@@ -2105,7 +2112,7 @@ class AssessmentEngine:
 
     async def _build_sessions(self):
         async with self._sm() as session:
-            a = await session.get(Assessment, self.assessment_id)
+            a = require(await session.get(Assessment, self.assessment_id), "assessment")
             accounts = (
                 (
                     await session.execute(
@@ -2126,7 +2133,7 @@ class AssessmentEngine:
                 if not renewed_auth.expired:
                     auth = renewed_auth
                     async with self._sm() as session:
-                        a = await session.get(Assessment, self.assessment_id)
+                        a = require(await session.get(Assessment, self.assessment_id), "assessment")
                         await write_audit(
                             session,
                             org_id=a.org_id,
@@ -2154,7 +2161,7 @@ class AssessmentEngine:
 
     async def _endpoint_view_by_id(self, endpoint_id: str) -> EndpointView | None:
         async with self._sm() as session:
-            e = await session.get(Endpoint, endpoint_id)
+            e = require(await session.get(Endpoint, endpoint_id), "endpoint")
             return _endpoint_view(e) if e else None
 
 

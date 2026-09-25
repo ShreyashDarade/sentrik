@@ -209,6 +209,8 @@ class GuardedHttpClient:
 
         from app.security.netguard import NetGuardError, parse_url
 
+        if self._client is None:
+            raise RuntimeError("GuardedHttpClient used outside its async context")
         req = self._client.build_request(
             method, url, headers=headers, params=params, data=data, json=json
         )

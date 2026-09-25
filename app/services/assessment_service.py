@@ -9,6 +9,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.db import require
 from app.core.enums import AssessmentState, VerificationStatus
 from app.models import (
     Assessment,
@@ -107,8 +108,10 @@ def finding_dict(f: Finding) -> dict:
 
 async def build_report(session: AsyncSession, a: Assessment) -> dict:
     """The full JSON report payload for an assessment (same as GET .../report)."""
-    target = await session.get(Target, a.target_id)
-    record = await session.get(AuthorizationRecord, a.authorization_id)
+    target = require(await session.get(Target, a.target_id), "target")
+    record = require(
+        await session.get(AuthorizationRecord, a.authorization_id), "authorization"
+    )
     endpoints = (
         (await session.execute(select(Endpoint).where(Endpoint.assessment_id == a.id)))
         .scalars()

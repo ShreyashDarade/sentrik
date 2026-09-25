@@ -21,13 +21,12 @@ from app.checks.base import registry
 
 log = logging.getLogger("sentrik.mcp")
 
-try:
-    from mcp.server.mcpserver import MCPServer
-    from mcp.server.mcpserver.exceptions import ToolError
+# MCP is a required dependency (nothing is optional). MCP_AVAILABLE stays as an
+# always-true capability marker for callers that branch on it.
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-    MCP_AVAILABLE = True
-except Exception:  # pragma: no cover
-    MCP_AVAILABLE = False
+MCP_AVAILABLE = True
 
 from app.integrations.protocol_auth import current_org_id
 
@@ -353,7 +352,13 @@ class LazyMcpApp:
 
     async def _ensure_started(self):
         loop = asyncio.get_running_loop()
-        if self._inner is not None and self._loop is loop and self._runner and not self._runner.done():
+        if (
+            self._inner is not None
+            and self._loop is loop
+            and self._runner is not None
+            and not self._runner.done()
+            and self._ready is not None
+        ):
             await self._ready.wait()
             return self._inner
         self._loop = loop

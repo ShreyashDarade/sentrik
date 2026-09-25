@@ -377,7 +377,7 @@ def _compact_context(ctx: dict, limit: int = 4000, *, max_str: int = 200) -> dic
     out: dict = json.loads(json.dumps(ctx, default=str))
     note: dict = {"strings_shortened": 0, "lists_trimmed": {}, "keys_dropped": []}
 
-    def shorten(obj):
+    def shorten(obj: Any) -> Any:
         if isinstance(obj, str) and len(obj) > max_str:
             note["strings_shortened"] += 1
             return obj[:max_str] + "…"

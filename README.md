@@ -110,7 +110,7 @@ client ──▶ FastAPI (app/api) ──▶ Assessment engine (app/orchestratio
 python -m venv .venv
 . .venv/Scripts/activate          # Windows;  source .venv/bin/activate on macOS/Linux
 pip install -r requirements.lock  # reproducible, pinned (what the Docker image installs)
-pip install --no-deps -e .        # the app itself; extras: .[agents,postgres,storage,observability,dev]
+pip install --no-deps -e .        # the app itself (every runtime dep is required; `.[dev]` adds test tools)
 
 uvicorn app.main:app --reload     # API + interactive docs at http://127.0.0.1:8000/docs
 ```

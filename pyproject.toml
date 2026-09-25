@@ -14,27 +14,32 @@ dependencies = [
     "python-jose[cryptography]>=3.3",
     "passlib[bcrypt]>=1.7",
     "PyYAML>=6.0",
-    # Google's A2A protocol SDK — required: Sentrik is an A2A agent (/a2a, agent card).
-    "a2a-sdk>=1.1.5",
-    # MCP — required: the API serves an MCP tool server over streamable-HTTP at /mcp.
-    "mcp>=2.2",
+    # Every runtime dependency is required — nothing is optional. The platform still keeps
+    # its deterministic fallbacks (e.g. rule-based brain when no API key is set), but the
+    # supporting libraries are always installed so every import resolves.
+    # Agent frameworks
+    "langchain>=0.3",
+    "langchain-core>=0.3",
+    "langchain-anthropic>=0.2",
+    "langgraph>=0.2",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "langgraph-checkpoint-postgres>=2.0",
+    "deepagents>=0.7",
+    # Protocols
+    "a2a-sdk>=1.1.5",  # Sentrik is an A2A agent (/a2a, agent card)
+    "mcp>=2.2",  # MCP tool server over streamable-HTTP at /mcp
     "dnspython>=2.4",
+    # Postgres, object storage, observability
+    "psycopg[binary]>=3.1",
+    "asyncpg>=0.29",
+    "boto3>=1.34",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "trio>=0.25"]
-# Framework-first agent stack (optional; the platform runs and is tested without these,
-# using deterministic fallbacks). Install with:  pip install ".[agents]"
-agents = [
-    "langchain-core>=0.3",
-    "langgraph>=0.2",
-    "langgraph-checkpoint-sqlite>=2.0",
-    "langchain-anthropic>=0.2",
-    "deepagents>=0.7",
-]
-postgres = ["psycopg[binary]>=3.1", "asyncpg>=0.29", "langgraph-checkpoint-postgres>=2.0"]
-storage = ["boto3>=1.34"]
-observability = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp-proto-http>=1.20"]
 
 [build-system]
 requires = ["setuptools>=68"]

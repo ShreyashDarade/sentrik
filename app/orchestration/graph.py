@@ -29,34 +29,27 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from app.core.config import get_settings
 
+if TYPE_CHECKING:
+    from langchain_core.runnables import RunnableConfig
+
 log = logging.getLogger("sentrik.graph")
 
-try:  # optional dependency
-    from langgraph.checkpoint.memory import MemorySaver
-    from langgraph.graph import END, StateGraph
-    from langgraph.types import Command, interrupt
+# LangGraph and its SQLite/Postgres checkpointers are required dependencies (nothing is
+# optional). The ``*_AVAILABLE`` flags remain as stable, always-true capability markers the
+# engine and tests read.
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
 
-    LANGGRAPH_AVAILABLE = True
-except Exception:  # pragma: no cover
-    LANGGRAPH_AVAILABLE = False
-
-try:  # durable checkpointer (crash-recoverable run state); optional
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-
-    SQLITE_CHECKPOINTER_AVAILABLE = True
-except Exception:  # pragma: no cover
-    SQLITE_CHECKPOINTER_AVAILABLE = False
-
-try:  # Postgres checkpointer for production deployments; optional
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-    POSTGRES_CHECKPOINTER_AVAILABLE = True
-except Exception:  # pragma: no cover
-    POSTGRES_CHECKPOINTER_AVAILABLE = False
+LANGGRAPH_AVAILABLE = True
+SQLITE_CHECKPOINTER_AVAILABLE = True
+POSTGRES_CHECKPOINTER_AVAILABLE = True
 
 
 def _checkpoint_db_path() -> str:
@@ -220,7 +213,7 @@ def build_assessment_graph(engine, checkpointer=None):
     return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
-def _config(assessment_id: str) -> dict:
+def _config(assessment_id: str) -> "RunnableConfig":
     return {"configurable": {"thread_id": assessment_id}}
 
 
@@ -267,7 +260,11 @@ async def run_via_langgraph(assessment_id: str) -> dict:
                 )
             else:
                 payload = {"assessment_id": assessment_id, "status": "running"}
-            final = await compiled.ainvoke(payload, config, durability="sync")
+            # payload is a fresh state dict, a resume Command, or None (continue) —
+            # all valid ainvoke inputs; the union is wider than the declared state type.
+            final = await compiled.ainvoke(
+                cast(Any, payload), config, durability="sync"
+            )
         if "__interrupt__" in final:
             outcome["parked"] = True
             outcome["status"] = "parked"

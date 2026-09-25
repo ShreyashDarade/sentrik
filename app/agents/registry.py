@@ -283,7 +283,8 @@ def snapshot_specs(checks: list[DeclarativeCheck]) -> list[dict]:
 
 def checks_from_snapshot(snapshot: list | None) -> list[DeclarativeCheck]:
     """Rebuild the exact checks a run planned with, from its frozen snapshot."""
-    return [build_declarative_check(dict(spec)) for spec in (snapshot or [])]
+    built = (build_declarative_check(dict(spec)) for spec in (snapshot or []))
+    return [c for c in built if c is not None]
 
 
 async def load_declarative_checks(

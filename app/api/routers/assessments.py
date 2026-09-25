@@ -24,7 +24,7 @@ from app.api.schemas import (
     StepDecision,
 )
 from app.core.auth import Principal, get_principal, require_role
-from app.core.db import get_session, get_sessionmaker
+from app.core.db import get_session, get_sessionmaker, require
 from app.core.enums import AssessmentState, FindingStatus, Role
 from app.models import (
     Assessment,
@@ -316,7 +316,7 @@ async def ingest_traffic(
     from app.security.scope import ScopeGuard
 
     a = await _get_assessment(session, principal, assessment_id)
-    record = await session.get(AuthorizationRecord, a.authorization_id)
+    record = require(await session.get(AuthorizationRecord, a.authorization_id), "authorization")
     guard = ScopeGuard(record)
     entries = body.get("entries", [])
     if not isinstance(entries, list) or not entries:
@@ -541,7 +541,7 @@ async def approve_step(
     followed by independent validation and re-scoring.
     """
     step = await _held_step(session, principal, assessment_id, step_id)
-    a = await session.get(Assessment, assessment_id)
+    a = require(await session.get(Assessment, assessment_id), "assessment")
     step.status = "approved"
     step.policy_decision = {
         **(step.policy_decision or {}),
@@ -974,7 +974,7 @@ async def attack_path(
     open-redirect enabling credential theft). This is a scoped, evidence-derived graph,
     not a cloud/identity lateral-movement graph (see docs/DECISIONS.md)."""
     a = await _get_assessment(session, principal, assessment_id)
-    target = await session.get(Target, a.target_id)
+    target = require(await session.get(Target, a.target_id), "target")
     endpoints = (
         (
             await session.execute(
@@ -994,7 +994,9 @@ async def attack_path(
         .all()
     )
 
-    nodes = [{"id": f"target:{target.id}", "type": "target", "label": target.name}]
+    nodes: list[dict[str, object]] = [
+        {"id": f"target:{target.id}", "type": "target", "label": target.name}
+    ]
     for e in endpoints:
         nodes.append(
             {
@@ -1017,7 +1019,7 @@ async def attack_path(
             }
         )
 
-    edges = []
+    edges: list[dict[str, object]] = []
     ep_ids = {e.id for e in endpoints}
     for e in endpoints:
         edges.append(
@@ -1049,7 +1051,7 @@ async def attack_path(
     ep_by_id = {e.id: e for e in endpoints}
 
     def _prefix(fid_endpoint_id: str | None) -> str:
-        e = ep_by_id.get(fid_endpoint_id)
+        e = ep_by_id.get(fid_endpoint_id) if fid_endpoint_id else None
         if not e:
             return ""
         segs = [s for s in (e.path_template or "").split("/") if s]
@@ -1148,7 +1150,7 @@ async def run_regression_tests(
     session: AsyncSession = Depends(get_session),
 ):
     a = await _get_assessment(session, principal, assessment_id)
-    record = await session.get(AuthorizationRecord, a.authorization_id)
+    record = require(await session.get(AuthorizationRecord, a.authorization_id), "authorization")
     tests = (
         (
             await session.execute(

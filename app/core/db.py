@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from typing import TypeVar
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import get_settings
+
+_T = TypeVar("_T")
+
+
+def require(obj: _T | None, what: str = "record") -> _T:
+    """Narrow ``X | None`` to ``X``, raising if the row is genuinely absent.
+
+    Used at ``session.get(...)`` sites where the row is expected to exist (it was created
+    earlier in the same lifecycle). Raising ``LookupError`` here turns a would-be
+    ``AttributeError on None`` into an explicit, typed failure and lets the type checker
+    treat the result as non-optional.
+    """
+    if obj is None:
+        raise LookupError(f"{what} not found")
+    return obj
 
 
 class Base(DeclarativeBase):

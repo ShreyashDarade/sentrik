@@ -1,13 +1,9 @@
 {
-  "//": "Point Pyright / basedpyright (and the editor's import resolver) at the project venv.",
-  "//2": "This is what fixes editor 'Import could not be resolved (reportMissingImports)' — the",
-  "//3": "packages are installed in .venv; the editor was resolving against a different interpreter.",
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.11",
   "include": ["app", "tests", "vulnapp", "benchmarks", "scripts"],
   "exclude": ["**/__pycache__", "**/node_modules", ".venv", "migrations"],
-  "reportMissingImports": "warning",
   "reportMissingModuleSource": "none",
   "typeCheckingMode": "basic"
 }
