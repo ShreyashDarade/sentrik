@@ -16,6 +16,9 @@ dependencies = [
     "PyYAML>=6.0",
     # Google's A2A protocol SDK — required: Sentrik is an A2A agent (/a2a, agent card).
     "a2a-sdk>=1.1.5",
+    # MCP — required: the API serves an MCP tool server over streamable-HTTP at /mcp.
+    "mcp>=2.2",
+    "dnspython>=2.4",
 ]
 
 [project.optional-dependencies]
@@ -28,10 +31,8 @@ agents = [
     "langgraph-checkpoint-sqlite>=2.0",
     "langchain-anthropic>=0.2",
     "deepagents>=0.7",
-    "mcp>=1.0",
-    "dnspython>=2.4",
 ]
-postgres = ["psycopg[binary]>=3.1", "asyncpg>=0.29"]
+postgres = ["psycopg[binary]>=3.1", "asyncpg>=0.29", "langgraph-checkpoint-postgres>=2.0"]
 storage = ["boto3>=1.34"]
 observability = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp-proto-http>=1.20"]
 

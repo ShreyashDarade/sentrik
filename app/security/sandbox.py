@@ -185,7 +185,7 @@ class Sandbox:
             raise
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 — wrap for clean sandbox reporting
+        except Exception as exc:  # wrap for clean sandbox reporting
             raise SandboxError(f"sandboxed work failed: {exc!r}") from exc
 
 

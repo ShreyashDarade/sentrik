@@ -66,7 +66,9 @@ async def init_db() -> None:
     column sync below makes the documented deploy path ("new tables and columns appear
     on startup") actually true for databases created by an earlier version.
     """
-    from app import models  # noqa: F401  ensure models are registered
+    import importlib
+
+    importlib.import_module("app.models")  # ensure ORM models are registered
 
     engine = get_engine()
     async with engine.begin() as conn:
@@ -90,7 +92,7 @@ def _add_missing_columns(sync_conn) -> None:
             col_type = column.type.compile(dialect=dialect)
             default = ""
             if column.default is not None and getattr(column.default, "is_scalar", False):
-                arg = column.default.arg
+                arg = getattr(column.default, "arg", None)
                 if isinstance(arg, bool):
                     default = f" DEFAULT {1 if arg else 0}"
                 elif isinstance(arg, int | float):

@@ -119,7 +119,7 @@ def configure_tracing() -> None:
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
             InMemorySpanExporter,
         )
-    except Exception:  # noqa: BLE001  pragma: no cover
+    except Exception:  # pragma: no cover
         _TRACING_READY = True
         return
 
@@ -140,7 +140,7 @@ def configure_tracing() -> None:
             provider.add_span_processor(
                 BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             log = logging.getLogger("sentrik.tracing")
             log.warning("OTLP exporter unavailable; traces captured in-memory only")
 
@@ -183,7 +183,7 @@ class _AttrSpan:
             s.set_attribute("request_id", request_id_var.get())
             for k, v in self._attrs.items():
                 s.set_attribute(k, v)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return s
 

@@ -107,7 +107,7 @@ def parse_skill_md(text: str) -> SkillManifest:
         import yaml
 
         meta = yaml.safe_load(fm) or {}
-    except Exception:  # noqa: BLE001
+    except Exception:
         meta = {}
     if not isinstance(meta, dict):
         meta = {}

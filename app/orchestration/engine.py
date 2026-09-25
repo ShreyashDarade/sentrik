@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 from datetime import UTC, datetime
 
 from sqlalchemy import func, select
@@ -150,7 +152,7 @@ def start_approved_steps(assessment_id: str, step_ids: list[str]) -> None:
         try:
             async with _sem():
                 await AssessmentEngine(assessment_id).execute_approved_steps(step_ids)
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("approved-step execution failed for %s", assessment_id)
         finally:
             _running.pop(key, None)
@@ -439,7 +441,7 @@ class AssessmentEngine:
                 await self.mark_failed(
                     f"scope violation halted assessment: {exc.reason}"
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 await self.mark_failed(f"{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------------ #
@@ -481,7 +483,7 @@ class AssessmentEngine:
                     data=snapshot,
                 )
                 await session.commit()
-        except Exception:  # noqa: BLE001  accounting must never fail the assessment
+        except Exception:  # accounting must never fail the assessment
             log.debug("could not persist llm budget snapshot", exc_info=True)
 
     async def _agent_decision(
@@ -562,7 +564,7 @@ class AssessmentEngine:
                 warnings.extend(crawl_warn)
             except ScopeViolation as exc:
                 warnings.append(f"crawl blocked: {exc.reason}")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 warnings.append(f"crawl error: {exc}")
 
         discovery_agent = DiscoveryAgent(runner=_crawl_runner, brain=get_brain())
@@ -664,7 +666,7 @@ class AssessmentEngine:
     # ------------------------------------------------------------------ #
     # Phase: planning
     # ------------------------------------------------------------------ #
-    async def _phase_planning(self, endpoints: list[Endpoint]) -> list[PlanStep]:
+    async def _phase_planning(self, endpoints: Sequence[Endpoint]) -> list[PlanStep]:
         async with self._sm() as session:
             assessment = await session.get(Assessment, self.assessment_id)
             record = await session.get(AuthorizationRecord, assessment.authorization_id)
@@ -779,7 +781,7 @@ class AssessmentEngine:
     # Phase: policy — evaluate each planned step against the authorization record
     # ------------------------------------------------------------------ #
     async def _phase_policy(
-        self, guard: ScopeGuard, steps: list[PlanStep], *, wait: bool = True
+        self, guard: ScopeGuard, steps: Sequence[PlanStep], *, wait: bool = True
     ) -> list[PlanStep]:
         """Deterministic policy gate. ``wait=False`` (graph mode) returns immediately
         with held steps left ``awaiting_approval``; the graph parks on an interrupt
@@ -897,7 +899,7 @@ class AssessmentEngine:
     # Phase: execute — run approved steps via LLM-brained specialist agents
     # ------------------------------------------------------------------ #
     async def _phase_execute(
-        self, client: GuardedHttpClient, guard: ScopeGuard, steps: list[PlanStep]
+        self, client: GuardedHttpClient, guard: ScopeGuard, steps: Sequence[PlanStep]
     ) -> None:
         if not steps:
             self._exec_note = "no_execution:no_approved_steps"
@@ -991,8 +993,12 @@ class AssessmentEngine:
             )
             # Capability-based routing (AG-04): select the agent advertising the
             # 'security-check' capability rather than hard-coding the class.
-            agent_cls = (
-                capability_router.select("security-check") or SpecialistCheckAgent
+            # The "security-check" capability is always a SpecialistCheckAgent-shaped
+            # class ((check, check_ctx, brain, ...)); cast so the checker uses that
+            # constructor rather than the base Agent(brain, ...) signature.
+            agent_cls = cast(
+                type[SpecialistCheckAgent],
+                capability_router.select("security-check") or SpecialistCheckAgent,
             )
             agent = agent_cls(
                 check, cctx, brain=brain, max_steps=self.settings.max_recursion_depth
@@ -1074,7 +1080,7 @@ class AssessmentEngine:
         while not findings_queue.empty():
             try:
                 signals.append(findings_queue.get_nowait())
-            except Exception:  # noqa: BLE001
+            except Exception:
                 break
         if signals:
             sev_counts: dict[str, int] = {}
@@ -1350,8 +1356,9 @@ class AssessmentEngine:
                 base_url=ev.url,
                 sessions=sessions,
             )
-            agent_cls = (
-                capability_router.select("security-check") or SpecialistCheckAgent
+            agent_cls = cast(
+                type[SpecialistCheckAgent],
+                capability_router.select("security-check") or SpecialistCheckAgent,
             )
             agents.append(
                 agent_cls(
@@ -1525,7 +1532,7 @@ class AssessmentEngine:
             )
             try:
                 outcome = await agent.validate(ctx)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 outcome = None
                 log.warning("validation error for %s: %s", fid, exc)
             async with self._sm() as session:

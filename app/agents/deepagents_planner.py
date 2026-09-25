@@ -90,9 +90,9 @@ def _build_chat_model(model: Any, api_key: str) -> Any:
         return None
     if not isinstance(model, str):
         return model
-    from langchain_anthropic import ChatAnthropic
+    from langchain.chat_models import init_chat_model
 
-    return ChatAnthropic(model=model, api_key=api_key)
+    return init_chat_model(model, model_provider="anthropic", api_key=api_key)
 
 
 def build_reranker_agent(model: Any, api_key: str) -> Any:

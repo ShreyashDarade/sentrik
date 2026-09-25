@@ -172,7 +172,7 @@ def create_app() -> FastAPI:
             async with get_sessionmaker()() as session:
                 await session.execute(text("SELECT 1"))
             return {"status": "ready", "db": "ok"}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return JSONResponse(
                 status_code=503, content={"status": "not_ready", "db": f"error: {exc}"}
             )

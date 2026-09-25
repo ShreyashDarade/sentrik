@@ -44,10 +44,11 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass
+from typing import cast
 
 from app.checks.base import BaseCheck, CheckContext, RawEvidence, RawFinding
 from app.checks.xss import renderable_html_context
-from app.core.enums import Confidence, Severity, TestIntensity
+from app.core.enums import CheckClass, Confidence, Severity, TestIntensity
 from app.security.http_client import TargetUnreachable
 from app.security.redaction import build_evidence_exchange
 
@@ -121,10 +122,11 @@ class DeclarativeCheck(BaseCheck):
         self._description = str(self.manifest.get("description", ""))
         self._remediation = str(self.manifest.get("remediation", ""))
 
-    # BaseCheck expects check_class to expose `.value`
+    # BaseCheck exposes ``check_class`` as a ``CheckClass``; ``_ClassRef`` is a structural
+    # stand-in that duck-types it (``.value``) so arbitrary declarative class strings work.
     @property
-    def check_class(self):  # type: ignore[override]
-        return self._class
+    def check_class(self) -> CheckClass:
+        return cast(CheckClass, self._class)
 
     async def applies_to(self, ctx: CheckContext) -> bool:
         dtype = self.detector.get("type")
@@ -366,5 +368,5 @@ def build_declarative_check(manifest: dict) -> DeclarativeCheck | None:
         return None
     try:
         return DeclarativeCheck(manifest)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None

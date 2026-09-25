@@ -13,6 +13,8 @@ realistic assessment naturally runs 100+ agent instances, each brain-driven.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 from app.agents.base import Agent, AgentContext, DecisionRecord
 from app.agents.brain import Brain, BrainDecision, BrainTask
 from app.checks.base import BaseCheck, RawFinding
@@ -147,11 +149,14 @@ class DiscoveryAgent(Agent):
     role = "discovery"
     capabilities = ("discovery",)
 
-    def __init__(self, runner, brain: Brain | None = None, **kw):
+    def __init__(
+        self, runner: Callable[[], Awaitable[object]], brain: Brain | None = None, **kw
+    ):
         if runner is None or not callable(runner):
             raise ValueError("DiscoveryAgent requires an async crawl runner")
         super().__init__(brain=brain, **kw)
-        self._runner = runner  # async callable performing the actual discovery tools
+        # explicit annotation: the callable() guard above narrows the return type away.
+        self._runner: Callable[[], Awaitable[object]] = runner
         self.ran = False
 
     def _allowed_actions(self, ctx: AgentContext) -> list[str]:

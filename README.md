@@ -14,6 +14,48 @@ you don't own.
 
 ---
 
+## What it's for, the problem it solves, and who it affects
+
+**What it's for.** Sentrik runs the whole application/API penetration-testing lifecycle as a
+backend service: prove you own a target, scope exactly what may be tested, discover the
+attack surface, plan and execute checks with LLM-brained agents, independently re-prove each
+finding, score risk with a coverage denominator, and generate remediation and CI regression
+tests — then retest on every change.
+
+**The problem it solves.** Two problems at once:
+
+1. *Security testing does not scale by hand.* Manual pentests are slow, point-in-time, and
+   scarce. Teams ship faster than humans can re-test, so regressions slip out.
+2. *Autonomous ("agentic") testing is dangerous if the LLM is in charge of safety.* An agent
+   that can decide its own targets can be prompt-injected, hallucinate scope, or attack the
+   wrong system. Most "AI pentest" tools put the model on the critical safety path.
+
+Sentrik's answer is **authorization enforced outside the LLM**. The model plans and reasons,
+but a deterministic layer (`ScopeGuard` + guarded HTTP client + per-run sandbox) is the only
+egress and makes every allow/deny decision — allowed hosts/ports/methods/paths, testing
+window, request/rate/time budgets, deny-by-default on redirects and newly discovered assets,
+SSRF/metadata blocks, connect-to-pinned-IP anti-DNS-rebinding, and per-action approval for
+state-changing steps. The LLM can never widen its own scope. Findings are not trusted on the
+detector's say-so: a separate validator re-proves each one and reports
+confirmed / suspected / inconclusive / rejected, and untested surface is reported as
+untested — never as "secure".
+
+**How it affects you.** Security and platform teams get continuous, scoped, evidence-backed
+testing that is safe to point at staging or (carefully) production, with a full audit trail of
+who authorized what and what each agent did. Developers get reproducible findings, remediation
+guidance, and CI regression tests instead of a PDF. Compliance and leadership get coverage with
+an explicit denominator and an honest parity map (`docs/PARITY.md`) rather than marketing
+numbers. Because it is self-hostable and LLM-optional (a deterministic brain runs fully
+offline; a local OpenAI-compatible model keeps inference on-prem), regulated environments can
+run it without sending traffic or data to third parties.
+
+**Interoperates with your agent stack.** Sentrik is itself an MCP tool server (streamable-HTTP
+at `/mcp`) and an A2A agent (agent card at `/.well-known/agent-card.json`, JSON-RPC at `/a2a`),
+so other agents and IDEs (Claude Code, Cursor) can drive it — always within the same
+authorization boundary.
+
+---
+
 ## Why Sentrik
 
 - **Authorization outside the LLM.** Every outbound request passes a deterministic
@@ -28,8 +70,13 @@ you don't own.
   reflected XSS, BOLA/IDOR, security headers, open redirect — each re-proved by a
   separate validator (confirmed / suspected / inconclusive / rejected).
 - **Agentic, framework-first.** LLM brain per agent (LangChain `ChatAnthropic`),
-  durable LangGraph workflow, MCP tool server, A2A message bus, capability-based agent
-  pool — all with deterministic fallbacks so it runs and is testable offline.
+  durable LangGraph workflow with true checkpoint resume and `interrupt()`-based approval,
+  MCP tool server over streamable-HTTP, an A2A agent endpoint (agent card + JSON-RPC),
+  an in-process A2A bus, and a capability-based agent pool — all with deterministic
+  fallbacks so the core runs and is testable offline.
+- **Extensible by hooks and skills.** Pre/post tool & phase lifecycle hooks (a pre-tool
+  hook can veto a check with an audited reason); versioned, immutable `SKILL.md` checks
+  that a run snapshots so a registry change mid-run cannot alter an active assessment.
 - **Declarative checks with no code.** Register a new detection at runtime from a
   versioned `SKILL.md` manifest (6 detector types) — validated on registration.
 - **Explainable, versioned risk scoring** with coverage and uncertainty. Untested
@@ -211,6 +258,11 @@ Base URL: `http://127.0.0.1:8000`. Interactive docs (OpenAPI/Swagger): **`/docs`
 | GET | `/v1/assessments/{id}/coverage` | any | coverage + its denominator |
 | GET | `/v1/assessments/{id}/attack-path` | any | scoped attack-path graph |
 | GET | `/v1/assessments/{id}/report` | any | report (`?fmt=json|markdown|pdf`) |
+| POST | `/v1/assessments/{id}/report/export` | operator | render + store report to object storage (db/local/s3) |
+| POST | `/v1/assessments/{id}/export/siem` | operator | export findings as SIEM events (`?fmt=ecs|cef`, `sink=response|file`) |
+| POST | `/v1/assessments/{id}/remediation-pr` | operator | open an advisory remediation change set (provider-agnostic; `local`) |
+| GET | `/v1/assessments/{id}/steps` | any | plan steps (`?status=awaiting_approval` for held actions) |
+| POST | `/v1/assessments/{id}/steps/{sid}/approve` and `/deny` | operator | per-action approval of state-changing/invasive steps |
 | GET | `/v1/assessments/{id}/audit` | any | full audit trail (agent decisions, policy, lineage) |
 | POST | `/v1/assessments/{id}/regression-tests` | operator | generate regression tests from confirmed findings |
 | POST | `/v1/assessments/{id}/regression-run` | operator | run regression tests |
@@ -225,6 +277,18 @@ Base URL: `http://127.0.0.1:8000`. Interactive docs (OpenAPI/Swagger): **`/docs`
 | GET/POST | `/v1/skills` | admin (POST) | list / register a `SKILL.md` (built-in + declarative checks) |
 | GET/PUT | `/v1/memory` | operator (PUT) | tenant-isolated project memory |
 | DELETE | `/v1/memory/{id}` | operator | delete a memory entry |
+| POST | `/v1/targets/{id}/cloud-assets/evaluate` | operator | enumerate cloud/identity assets (provider seam) and gate each deny-by-default |
+
+### Protocol endpoints (agent interop)
+
+Both require the same `X-API-Key` / Bearer JWT as the REST API and stay tenant-scoped; the
+A2A agent card is public discovery metadata.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/mcp` | MCP server over streamable-HTTP (spec 2026-07-28); tools = `run_check` + one per check, plus a `sentrik://assessments/{id}/report` resource |
+| GET | `/.well-known/agent-card.json` | A2A agent card (skills, JSONRPC interface, API-key scheme) |
+| POST | `/a2a` | A2A JSON-RPC binding (`message/send`, `tasks/get`, `tasks/cancel`) — an A2A task **is** an assessment |
 
 ### End-to-end walkthrough (curl)
 

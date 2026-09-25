@@ -842,8 +842,8 @@ async def export_report(
     (db/local/s3). Returns a persistable ObjectRef the caller can keep."""
     from app.services.storage import get_storage
 
-    # reuse the report renderer
-    payload = await report(assessment_id, fmt="json", principal=principal, session=session)
+    a = await _get_assessment(session, principal, assessment_id)
+    payload = await build_report(session, a)
     if fmt == "markdown":
         data = reporting.render_markdown(payload).encode()
         content_type = "text/markdown"

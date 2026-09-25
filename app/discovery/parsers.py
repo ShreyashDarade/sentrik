@@ -40,7 +40,7 @@ def _load(content: str | dict) -> tuple[dict | list | None, str | None]:
         import yaml
 
         return yaml.safe_load(text), None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return None, f"could not parse as JSON or YAML: {exc}"
 
 
@@ -224,7 +224,7 @@ def parse_har(
                     auth_required=auth,
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             res.warnings.append(f"skipped malformed HAR entry: {exc}")
     return res
 

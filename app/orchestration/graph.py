@@ -41,21 +41,21 @@ try:  # optional dependency
     from langgraph.types import Command, interrupt
 
     LANGGRAPH_AVAILABLE = True
-except Exception:  # noqa: BLE001  pragma: no cover
+except Exception:  # pragma: no cover
     LANGGRAPH_AVAILABLE = False
 
 try:  # durable checkpointer (crash-recoverable run state); optional
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     SQLITE_CHECKPOINTER_AVAILABLE = True
-except Exception:  # noqa: BLE001  pragma: no cover
+except Exception:  # pragma: no cover
     SQLITE_CHECKPOINTER_AVAILABLE = False
 
 try:  # Postgres checkpointer for production deployments; optional
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
     POSTGRES_CHECKPOINTER_AVAILABLE = True
-except Exception:  # noqa: BLE001  pragma: no cover
+except Exception:  # pragma: no cover
     POSTGRES_CHECKPOINTER_AVAILABLE = False
 
 

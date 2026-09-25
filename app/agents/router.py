@@ -25,7 +25,7 @@ class CapabilityRouter:
         self._by_capability: dict[str, type[Agent]] = {}
 
     def register(self, agent_cls: type[Agent]) -> None:
-        for cap in getattr(agent_cls, "capabilities", ()):  # type: ignore[attr-defined]
+        for cap in getattr(agent_cls, "capabilities", ()):
             self._by_capability.setdefault(cap, agent_cls)
 
     def select(self, capability: str) -> type[Agent] | None:

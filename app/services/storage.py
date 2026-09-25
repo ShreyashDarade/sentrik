@@ -204,13 +204,13 @@ class S3Backend(StorageBackend):
     name = "s3"
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
-        try:
-            import boto3  # noqa: F401
-        except ImportError as exc:  # pragma: no cover - exercised only without boto3
+        import importlib.util
+
+        if importlib.util.find_spec("boto3") is None:  # pragma: no cover - needs boto3 absent
             raise RuntimeError(
                 "S3 storage backend requires boto3; install it with "
                 "`pip install boto3` or set SENTINEL_STORAGE_BACKEND to 'db'/'local'."
-            ) from exc
+            )
 
         self._settings = settings or get_settings()
         if not self._settings.s3_bucket:

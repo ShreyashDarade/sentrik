@@ -26,7 +26,7 @@ try:
     from mcp.server.mcpserver.exceptions import ToolError
 
     MCP_AVAILABLE = True
-except Exception:  # noqa: BLE001  pragma: no cover
+except Exception:  # pragma: no cover
     MCP_AVAILABLE = False
 
 from app.integrations.protocol_auth import current_org_id
@@ -376,7 +376,7 @@ class LazyMcpApp:
             self._stop.set()
             try:
                 await asyncio.wait_for(self._runner, timeout=5)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         self._inner = None
         self._runner = None

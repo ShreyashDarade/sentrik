@@ -180,6 +180,9 @@ class SentrikAgentExecutor(AgentExecutor):
         self.wait_seconds = wait_seconds
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # The SDK populates task_id/context_id before dispatching execute(); assert the
+        # invariant so the type checker (and a future SDK change) treats them as non-None.
+        assert context.task_id is not None and context.context_id is not None
         if context.current_task is None:
             # A new conversation: the SDK requires the Task itself to be the first event.
             await event_queue.enqueue_event(
@@ -323,13 +326,14 @@ class SentrikAgentExecutor(AgentExecutor):
         return state
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        assert context.task_id is not None and context.context_id is not None
         updater = TaskUpdater(event_queue, context.task_id, context.context_id)
         task = context.current_task
         assessment_id = ""
         if task is not None and task.metadata:
             try:
                 assessment_id = str(dict(task.metadata).get("assessment_id") or "")
-            except Exception:  # noqa: BLE001
+            except Exception:
                 assessment_id = ""
         user = context.call_context.user if context.call_context else None
         org_id = user.user_name if user and user.is_authenticated else ""

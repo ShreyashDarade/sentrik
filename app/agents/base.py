@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.agents.brain import Brain, BrainDecision, BrainTask, get_brain
@@ -44,14 +45,14 @@ class AgentContext:
     """Shared, read-mostly context handed to an agent. No authorization record here."""
 
     assessment_id: str
-    budget_remaining_getter: object = None  # callable -> int
+    budget_remaining_getter: Callable[[], int] | None = None
     extra: dict = field(default_factory=dict)
 
     def budget_remaining(self) -> int:
-        if callable(self.budget_remaining_getter):
+        if self.budget_remaining_getter is not None:
             try:
                 return int(self.budget_remaining_getter())
-            except Exception:  # noqa: BLE001
+            except Exception:
                 return 1
         return 1
 
@@ -143,7 +144,7 @@ class Agent:
                 if not self._can_revise(ctx, step):
                     break
             result.steps_used = len([d for d in self._decisions])
-        except Exception as exc:  # noqa: BLE001  — an agent failure must not crash the pool
+        except Exception as exc:  # an agent failure must not crash the pool
             result.error = f"{type(exc).__name__}: {exc}"
         result.decisions = list(self._decisions)
         return result

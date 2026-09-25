@@ -45,7 +45,7 @@ class AgentPool:
             return False
         try:
             return bool(self._cancel_predicate())
-        except Exception:  # noqa: BLE001
+        except Exception:
             return False
 
     async def _run_one(self, agent: Agent, ctx: AgentContext) -> AgentResult:
@@ -62,7 +62,7 @@ class AgentPool:
             except TimeoutError:
                 self.stats.errored += 1
                 return AgentResult(agent_id=agent.id, role=agent.role, error="timeout")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self.stats.errored += 1
                 return AgentResult(agent_id=agent.id, role=agent.role, error=str(exc))
             self._tally(result)

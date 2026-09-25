@@ -94,7 +94,7 @@ def _verify_dns(host: str, token: str) -> VerificationOutcome:
         # Prefer dnspython if present, else fall back to a TXT lookup via socket is not
         # possible; use a minimal resolver via socket.getaddrinfo is insufficient for TXT.
         try:
-            import dns.resolver  # type: ignore
+            import dns.resolver
 
             answers = dns.resolver.resolve(host, "TXT")
             values = [
@@ -115,7 +115,7 @@ def _verify_dns(host: str, token: str) -> VerificationOutcome:
             VerificationStatus.FAILED,
             f"expected TXT {want!r} not found (saw {values[:5]})",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return VerificationOutcome(
             VerificationStatus.FAILED, f"DNS lookup failed: {exc}"
         )

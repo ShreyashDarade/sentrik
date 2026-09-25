@@ -68,7 +68,7 @@ class HookRegistry:
                 res = fn(dict(payload))
                 if inspect.isawaitable(res):
                     res = await res
-            except Exception as exc:  # noqa: BLE001 — observer failure must not propagate
+            except Exception as exc:  # observer failure must not propagate
                 log.warning("hook %s/%s failed: %s", event, name, exc)
                 outcome.errors.append(f"{name}: {type(exc).__name__}: {exc}")
                 continue

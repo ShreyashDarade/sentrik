@@ -107,14 +107,25 @@ _SYSTEM_PROMPT = (
 
 
 def _langchain_client(model: str, api_key: str):
-    """Return a LangChain ChatAnthropic client if langchain-anthropic is available."""
+    """Return a LangChain Anthropic chat model, or None if unavailable.
+
+    Uses ``init_chat_model`` (the LangChain-recommended factory) rather than constructing
+    ``ChatAnthropic`` directly: it takes provider-agnostic ``**kwargs`` and returns a typed
+    ``BaseChatModel``, so ``max_tokens``/``timeout`` pass straight through.
+    """
     try:
-        from langchain_anthropic import ChatAnthropic
-    except Exception:  # noqa: BLE001
+        from langchain.chat_models import init_chat_model
+    except Exception:
         return None
     try:
-        return ChatAnthropic(model=model, api_key=api_key, max_tokens=512, timeout=30)
-    except Exception:  # noqa: BLE001
+        return init_chat_model(
+            model,
+            model_provider="anthropic",
+            api_key=api_key,
+            max_tokens=512,
+            timeout=30,
+        )
+    except Exception:
         return None
 
 
@@ -158,7 +169,7 @@ class LLMBrain(Brain):
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             log.warning("LLM brain error (%s); falling back", exc)
             return await self._fallback_with_source(task)
-        except Exception as exc:  # noqa: BLE001  langchain raises varied types
+        except Exception as exc:  # langchain raises varied types
             log.warning("LLM brain (langchain) error (%s); falling back", exc)
             return await self._fallback_with_source(task)
 
@@ -177,6 +188,9 @@ class LLMBrain(Brain):
     async def _decide_langchain(self, user: str) -> tuple[str, tuple[int, int]]:
         from langchain_core.messages import HumanMessage, SystemMessage
 
+        # Only reached when the client was constructed (decide() guards on it).
+        if self._lc is None:
+            raise RuntimeError("langchain client unavailable")
         resp = await self._lc.ainvoke(
             [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=user)]
         )
@@ -270,7 +284,7 @@ class LocalLLMBrain(Brain):
             data = resp.json()
             text = data["choices"][0]["message"]["content"]
             decision = _parse_decision(text)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.warning("local LLM brain error (%s); falling back", exc)
             d = await self._fallback.decide(task)
             d.source = "local_llm_fallback"
